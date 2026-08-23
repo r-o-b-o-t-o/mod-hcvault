@@ -207,6 +207,11 @@ HcVault.Mail.Body = "Someone made it far enough to give these away. Now they're 
 #
 #     Logger.module.hcvault = 4,Console Server
 #
-#   Level 4 is Debug, which reports each cycle and each push. Level 3 (Info) is enough in normal
-#   operation: it reports what was collected, what was delivered, and anything refused.
+#   Levels are the core's own: 0 disabled, 1 fatal, 2 error, 3 warning, 4 info, 5 debug, 6 trace.
+#
+#   4 (Info) is the one to run with: it reports what was collected, what was delivered, and anything
+#   refused. 5 (Debug) adds a line per cycle and per push.
+#
+#   Note that the stock Console appender is itself capped at Info, so raising this logger to Debug
+#   puts those lines in Server.log and not on the console until Appender.Console is raised too.
 #

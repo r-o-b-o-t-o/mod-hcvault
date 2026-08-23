@@ -152,8 +152,11 @@ core does not otherwise label. Add the logger to your configuration:
 Logger.module.hcvault = 4,Console Server
 ```
 
-Level 3 (Info) reports what was collected, what was delivered and anything refused, which is enough
-in normal operation. Level 4 (Debug) adds a line per cycle and per push.
+Levels are the core's own: 0 disabled, 1 fatal, 2 error, 3 warning, 4 info, 5 debug, 6 trace.
+
+**4 (Info)** is the one to run with — what was collected, what was delivered, and anything refused.
+**5 (Debug)** adds a line per cycle and per push. The stock `Appender.Console` is itself capped at
+Info, so Debug lines reach `Server.log` and not the console until that is raised too.
 
 ## Refusals
 
