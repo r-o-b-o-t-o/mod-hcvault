@@ -1,0 +1,212 @@
+[worldserver]
+
+########################################
+# mod-hcvault configuration
+########################################
+#
+# The Hardcore Vault runs on one character. This module empties that character's mailbox into a
+# table of its own, tells the vault website what it is holding, and mails out the orders the
+# website's operator has approved.
+#
+# The website is the only thing that decides what goes out. This module never decides to send
+# anything; it does what an approved order says, and refuses when the recipient does not qualify.
+#
+
+#
+#    HcVault.Enabled
+#        Description: Master switch. Everything below is ignored while this is 0.
+#        Default:     0 - Disabled
+#                     1 - Enabled
+#
+
+HcVault.Enabled = 0
+
+#
+#    HcVault.VaultCharacterGuid
+#        Description: Low GUID of the vault character - the one donations are mailed to and orders
+#                     are sent from. This is the `guid` column of the `characters` table, not the
+#                     account id and not the name.
+#
+#                     There is deliberately no default. The module refuses to run until this is set,
+#                     because a guessed value would have it emptying somebody else's mailbox.
+#        Default:     0 - (the module does nothing)
+#
+
+HcVault.VaultCharacterGuid = 0
+
+#
+#    HcVault.Website.Url
+#        Description: Where the vault website is, including the scheme and any path it is mounted
+#                     under. The scheme decides whether TLS is used and the default port.
+#
+#                     http:// additionally requires HcVault.Website.AllowInsecureHttp below, so
+#                     running without TLS is always two deliberate steps rather than one typed slip.
+#        Example:     "https://vault.example.com"
+#                     "https://vault.example.com:8443"
+#                     "https://example.com/vault"   - (site mounted under a path)
+#                     "http://127.0.0.1:5006"       - (local debugging; see below)
+#        Default:     ""
+#
+
+HcVault.Website.Url = ""
+
+#
+#    HcVault.Website.AllowInsecureHttp
+#        Description: Permits an http:// URL above.
+#
+#                     The passkey travels on every request and authenticates calls that can empty the
+#                     vault and mail its contents anywhere. Over plain http it is readable by anything
+#                     on the path, and replayable by anything that reads it.
+#
+#                     Intended for a local debug setup where the whole conversation stays on one
+#                     machine. The module logs a warning on every startup while this is on, because it
+#                     is the setting most likely to be enabled for an afternoon and left enabled.
+#        Default:     0 - Disabled (an http:// URL is refused, and the module says so)
+#                     1 - Enabled
+#
+
+HcVault.Website.AllowInsecureHttp = 0
+
+#
+#    HcVault.Website.Passkey
+#        Description: Shared secret sent as `Authorization: Bearer <passkey>`. Must match the
+#                     website's Module:Passkey setting exactly. Generate a long random value; it
+#                     is the whole of the authentication.
+#        Default:     ""
+#
+
+HcVault.Website.Passkey = ""
+
+#
+#    HcVault.Website.VerifyCertificate
+#        Description: Whether the website's TLS certificate is checked against the system trust
+#                     store, including its host name. Ignored for an http:// URL, where there is no
+#                     certificate to check.
+#
+#                     Turn this off only against a self-signed certificate you control. With it off
+#                     the connection is encrypted but not authenticated: anything able to answer for
+#                     the host can read the passkey and hand back orders of its own choosing.
+#        Default:     1 - Enabled
+#                     0 - Disabled (encrypted, but trusts any certificate)
+#
+
+HcVault.Website.VerifyCertificate = 1
+
+#
+#    HcVault.PollInterval
+#        Description: Seconds between cycles. One cycle reads the mailbox, pushes the whole stock,
+#                     asks the website for work, does it, and reports back.
+#
+#                     A cycle is skipped entirely while the vault character is online, because a
+#                     logged-in player holds its mail and its purse in memory and would write both
+#                     back over anything done underneath it.
+#        Default:     60  (minimum 30)
+#
+
+HcVault.PollInterval = 60
+
+#
+#    HcVault.HttpTimeout
+#        Description: Seconds before a request to the website is abandoned. Bounded so a website
+#                     that has stopped answering cannot wedge the cycle.
+#        Default:     15  (clamped to 3-120)
+#
+
+HcVault.HttpTimeout = 15
+
+#
+#    HcVault.ChallengeDatabase
+#    HcVault.ChallengeTable
+#        Description: Where the challenge-mode rows live. Read through the characters connection, so
+#                     the database must be on the same MySQL server and readable by the same user.
+#
+#                     Both are SQL identifiers rather than values, so they cannot be bound as query
+#                     parameters. They are checked to be letters, digits and underscores only, and
+#                     the module refuses to run when they are not.
+#        Default:     "ac_eluna"
+#                     "challenge_modes_character"
+#
+
+HcVault.ChallengeDatabase = "ac_eluna"
+HcVault.ChallengeTable = "challenge_modes_character"
+
+#
+#    HcVault.AllowedChallengeMask
+#        Description: The `challenge` bitmask a recipient must be running for an order to be
+#                     delivered. Hardcore = 1, Ironman = 2, Bloodthirsty = 4, added together.
+#
+#                     A character that does not qualify is refused even when the order was approved:
+#                     the website is told why, and the line goes back into the queue.
+#        Default:     1 - (Hardcore)
+#
+
+HcVault.AllowedChallengeMask = 1
+
+#
+#    HcVault.ChallengeMatchExact
+#        Description: Whether the recipient's mask must equal AllowedChallengeMask exactly (1), or
+#                     merely contain those bits (0).
+#
+#                     Exact by default, because the server only lets characters trade with others
+#                     running the identical set of challenges - a character running more cannot
+#                     receive the mail even though its mask contains what is asked for.
+#        Default:     1 - Exact
+#                     0 - At least these bits
+#
+
+HcVault.ChallengeMatchExact = 1
+
+#
+#    HcVault.RefuseDeadRecipients
+#        Description: Refuse to deliver to a character the challenge table marks as dead. A dead
+#                     hardcore character cannot use anything sent to it.
+#        Default:     1 - Enabled
+#
+
+HcVault.RefuseDeadRecipients = 1
+
+#
+#    HcVault.Website.Compress
+#        Description: Gzip request bodies before sending them.
+#
+#                     The stock push is the only payload big enough to matter — every cycle sends the
+#                     whole vault — and it is repetitive JSON, so it goes out at roughly a ninth of
+#                     its size. The compression runs on a network thread, never on the world thread,
+#                     and costs a fraction of a millisecond.
+#
+#                     Turn it off only if something between here and the website mishandles
+#                     Content-Encoding on a request. The website understands both either way.
+#        Default:     1 - Enabled
+#
+
+HcVault.Website.Compress = 1
+
+#
+#    HcVault.Mail.Body
+#        Description: Body of the mail an order arrives in.
+#
+#                     \n is a line break, \r and \t likewise; \\ is one literal backslash.
+#                     Anything else after a backslash is left as it was typed. Line breaks are the
+#                     only formatting the mail window has.
+#
+#                     The subject is not configurable. It reads "Hardcore Vault Order #237b142d",
+#                     carrying the reference the website showed whoever placed the order, so a
+#                     parcel in game and a card in the backoffice can be matched up.
+#        Example:     "Here is your order.\n\nGood luck out there!"
+#        Default:     Three short paragraphs: where the goods came from, how to donate, and a
+#                     sign-off. Written for a hardcore realm; change it to suit yours.
+#
+
+HcVault.Mail.Body = "Someone made it far enough to give these away. Now they're yours.\n\nYour bank is somebody else's lifeline. Mail what you don't need to Hcvault, and it'll be on the site for the next poor soul at 12% health.\n\nSpread the word and stay alive out there!"
+
+#
+# Logging
+#
+#   The module logs under "module.hcvault". Add it to your logger configuration to see anything
+#   below the default threshold, for example:
+#
+#     Logger.module.hcvault = 4,Console Server
+#
+#   Level 4 is Debug, which reports each cycle and each push. Level 3 (Info) is enough in normal
+#   operation: it reports what was collected, what was delivered, and anything refused.
+#
