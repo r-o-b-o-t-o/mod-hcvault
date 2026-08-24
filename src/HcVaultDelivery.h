@@ -49,6 +49,34 @@ namespace HcVault
         std::string Reason;
     };
 
+    /// A reply the operator wrote to a donation letter, waiting to be posted.
+    ///
+    /// The mail it answers is long gone — collecting it is what deletes it — so this is an ordinary
+    /// new mail that happens to carry "RE:" and the original subject.
+    struct Reply
+    {
+        int32 ReplyId = 0;
+        std::string Recipient;
+        std::string Subject;
+        std::string Body;
+    };
+
+    /// What became of one reply.
+    struct ReplyOutcome
+    {
+        int32 ReplyId = 0;
+        bool Sent = false;
+
+        /// Why not, phrased for whoever reads the message card. Empty on success.
+        std::string Reason;
+    };
+
+    /// Posts one reply, recording it in `mod_hcvault_reply` in the same transaction so a report lost
+    /// on the way back cannot send it twice.
+    ///
+    /// Must run on the world thread, with the vault character offline.
+    ReplyOutcome SendReply(Config const& config, Reply const& reply);
+
     /// An order whose recipient the website wants described.
     struct RecipientRequest
     {
@@ -60,10 +88,24 @@ namespace HcVault
     struct RecipientInfo
     {
         int32 OrderId = 0;
+
+        /// False only when no character has ever borne the name. A hardcore death deletes the
+        /// character, so this stays true for one that died — the card should say "dead", not "no such
+        /// character".
         bool Exists = false;
 
+        /// The realm still has this character, so mail can reach it. False for one that died.
+        bool Live = false;
+
+        /// Low guid of whoever the name resolved to, or 0 when it resolved to nobody. Carried so the
+        /// caller need not look the name up a second time and hope for the same answer.
+        uint32 Guid = 0;
+
         bool HasLevel = false;
-        int32 Level = 0;
+        uint8 Level = 0;
+
+        bool HasClass = false;
+        uint8 Class = 0;
 
         /// False when the character is running no challenge at all, which is not the same as one
         /// whose challenge simply does not match.

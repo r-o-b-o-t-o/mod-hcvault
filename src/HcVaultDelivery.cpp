@@ -1,9 +1,9 @@
 #include "HcVaultDelivery.h"
 
-#include "CharacterCache.h"
 #include "DatabaseEnv.h"
 #include "Field.h"
 #include "GameTime.h"
+#include "HcVaultCharacters.h"
 #include "HcVaultConfig.h"
 #include "HcVaultStock.h"
 #include "Item.h"
@@ -25,25 +25,6 @@ namespace HcVault
 
         /// Line id recorded for an order's money, which has no line of its own.
         constexpr int32 kMoneyLineId = 0;
-
-        /// Reads the challenge row for a character, if it has one.
-        bool TryReadChallenge(Config const& config, uint32 characterGuid, int32& challenge, bool& dead)
-        {
-            // Database and table are identifiers, which cannot be bound as parameters. They are
-            // validated as plain identifiers when the config is loaded, and the module refuses to run
-            // when they are not — see Config::Problem.
-            QueryResult result = CharacterDatabase.Query(
-                "SELECT challenge, dead FROM `{}`.`{}` WHERE guid = {}",
-                config.ChallengeDatabase, config.ChallengeTable, characterGuid);
-
-            if (!result)
-                return false;
-
-            Field* fields = result->Fetch();
-            challenge = fields[0].Get<int8>();
-            dead = fields[1].Get<uint8>() != 0;
-            return true;
-        }
 
         bool ChallengeSatisfies(Config const& config, int32 challenge)
         {
@@ -168,28 +149,92 @@ namespace HcVault
         RecipientInfo info;
         info.OrderId = request.OrderId;
 
-        ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(request.Recipient);
-        if (!guid)
+        ResolvedCharacter const character = ResolveByName(config, request.Recipient);
+        if (!character.Found)
             return info;
 
         info.Exists = true;
-        info.HasLevel = true;
-        info.Level = sCharacterCache->GetCharacterLevelByGuid(guid);
+        info.Live = character.Live;
+        info.Guid = character.Guid;
+        info.HasLevel = character.HasLevel;
+        info.Level = character.Level;
+        info.HasClass = character.HasClass;
+        info.Class = character.Class;
+        info.HasChallenge = character.HasChallenge;
+        info.Challenge = character.Challenge;
+        info.Dead = character.Dead;
 
-        int32 challenge = 0;
-        bool dead = false;
-        if (TryReadChallenge(config, guid.GetCounter(), challenge, dead))
-        {
-            info.HasChallenge = true;
-            info.Challenge = challenge;
-            info.Dead = dead;
-        }
-
-        info.Eligible = info.HasChallenge
+        // Live first, and not as a formality: a character the realm has deleted cannot be mailed at
+        // all, whatever its record says. That is what a hardcore death leaves behind.
+        info.Eligible = character.Live
+            && info.HasChallenge
             && ChallengeSatisfies(config, info.Challenge)
             && !(config.RefuseDeadRecipients && info.Dead);
 
         return info;
+    }
+
+    ReplyOutcome SendReply(Config const& config, Reply const& reply)
+    {
+        ReplyOutcome outcome;
+        outcome.ReplyId = reply.ReplyId;
+
+        // Already posted on an attempt whose report never arrived. Saying so again is the whole point
+        // of keeping the record.
+        if (QueryResult existing = CharacterDatabase.Query(
+                "SELECT 1 FROM mod_hcvault_reply WHERE reply_id = {}", reply.ReplyId))
+        {
+            LOG_INFO("module.hcvault",
+                "[HCVault] Reply {} was already sent; reporting it again rather than resending.", reply.ReplyId);
+
+            outcome.Sent = true;
+            return outcome;
+        }
+
+        ResolvedCharacter const recipient = ResolveByName(config, reply.Recipient);
+
+        // A reply needs somewhere to land, and that is all it needs: no challenge check and no
+        // eligibility, because answering a letter is not the same as handing out goods. Somebody who
+        // donated and then died deserves an answer if the character is still there to read it.
+        if (!recipient.Found)
+        {
+            outcome.Reason = "no character named " + reply.Recipient + " has ever existed on this realm";
+            return outcome;
+        }
+
+        if (!recipient.Live)
+        {
+            outcome.Reason = recipient.Dead
+                ? reply.Recipient + " has died, so there is no mailbox left to write to"
+                : reply.Recipient + " is no longer on the realm";
+            return outcome;
+        }
+
+        auto const recipientLow = recipient.Guid;
+
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+        MailDraft draft(reply.Subject, reply.Body);
+
+        trans->Append("INSERT INTO mod_hcvault_reply (reply_id, sent_at) VALUES ({}, {}) "
+                      "ON DUPLICATE KEY UPDATE sent_at = sent_at",
+            reply.ReplyId, static_cast<uint32>(GameTime::GetGameTime().count()));
+
+        Player* online = ObjectAccessor::FindPlayerByLowGUID(recipientLow);
+        MailReceiver const receiver = online
+            ? MailReceiver(online, recipientLow)
+            : MailReceiver(recipientLow);
+
+        draft.SendMailTo(trans, receiver,
+            MailSender(MAIL_NORMAL, config.VaultCharacterGuid, MAIL_STATIONERY_DEFAULT),
+            MAIL_CHECK_MASK_NONE);
+
+        CharacterDatabase.CommitTransaction(trans);
+
+        LOG_INFO("module.hcvault", "[HCVault] Replied to {} (reply {}).", reply.Recipient, reply.ReplyId);
+
+        outcome.Sent = true;
+        return outcome;
     }
 
     uint64 ReadVaultMoney(uint32 vaultCharacterGuid)
@@ -208,13 +253,6 @@ namespace HcVault
         // been mailed.
         auto const alreadyDelivered = AlreadyDelivered(delivery.OrderId);
 
-        ObjectGuid const recipientGuid = sCharacterCache->GetCharacterGuidByName(delivery.Recipient);
-        if (!recipientGuid)
-        {
-            return RefuseAll(delivery,
-                "no character named " + delivery.Recipient + " exists on this realm", alreadyDelivered);
-        }
-
         RecipientRequest describe;
         describe.OrderId = delivery.OrderId;
         describe.Recipient = delivery.Recipient;
@@ -222,19 +260,33 @@ namespace HcVault
         RecipientInfo const info = DescribeRecipient(config, describe);
         if (!info.Eligible)
         {
+            // Ordered by what actually stops the mail, the way SendReply orders it: whether there is
+            // a mailbox at all, then whether the vault serves whoever owns it. Death enters twice and
+            // means two different things — as the reason the mailbox is gone, and further down as the
+            // policy refusal it is for a character still standing. Reported ahead of both, it told a
+            // character refused for the wrong challenge that it was dead instead.
             std::string reason;
-            if (!info.HasChallenge)
+            if (!info.Exists)
+                reason = "no character named " + delivery.Recipient + " has ever existed on this realm";
+            else if (!info.Live)
+                reason = info.Dead
+                    ? delivery.Recipient + " has died, so there is no mailbox left to deliver to"
+                    : delivery.Recipient + " is no longer on the realm";
+            else if (!info.HasChallenge)
                 reason = delivery.Recipient + " is not running any challenge mode";
-            else if (config.RefuseDeadRecipients && info.Dead)
-                reason = delivery.Recipient + " is dead";
-            else
+            else if (!ChallengeSatisfies(config, info.Challenge))
                 reason = delivery.Recipient + " runs challenge " + std::to_string(info.Challenge)
                     + ", and the vault only serves " + std::to_string(config.AllowedChallengeMask);
+            else
+                reason = delivery.Recipient + " is dead";
 
             return RefuseAll(delivery, reason, alreadyDelivered);
         }
 
-        auto const recipientLow = recipientGuid.GetCounter();
+        // The guid the description resolved, rather than a second lookup of the same name. Asking
+        // twice invited the two answers to differ, and an empty guid quietly becomes 0 — an address
+        // for nobody, which the mail would be written to all the same.
+        auto const recipientLow = info.Guid;
 
         // One transaction for the whole order: the claims, the mails, the money and the delivery
         // records land together or not at all.

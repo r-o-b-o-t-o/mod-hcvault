@@ -22,8 +22,9 @@ One cycle, every `HcVault.PollInterval` seconds:
 4. **Ask.** The website says which approved lines to mail and which recipients to describe.
 5. **Do.** Items are pulled out of the vault — splitting stacks where the order asks for part of one,
    and merging what comes out back into full stacks — and put in the mail, under the subject
-   `Hardcore Vault Order #237b142d`. Recipients are looked up: level from the character cache,
-   challenge mode from the challenge-modes table.
+   `Hardcore Vault Order #237b142d`. Any replies the operator has written go out in the same pass.
+   Recipients are looked up: name, class and level from the character cache, challenge mode from the
+   challenge-modes table, and both from that table alone when the character has died.
 6. **Report.** What came of it goes back, along with a fresh stock push if anything moved.
 
 **The whole cycle is skipped while the vault character is online.** A logged-in player holds its mail
@@ -83,6 +84,7 @@ All in the characters database; see `data/sql/db-characters/`.
 | `mod_hcvault_delivery` | Order lines already mailed. This is what makes delivery exactly-once |
 | `mod_hcvault_letter` | Donation letters not yet accepted by the website |
 | `mod_hcvault_letter_item` | What came attached to those letters. Cascaded from the letter |
+| `mod_hcvault_reply` | Replies already mailed. Exactly-once, the same way deliveries are |
 
 ### Why the delivery table exists
 
@@ -157,6 +159,27 @@ Levels are the core's own: 0 disabled, 1 fatal, 2 error, 3 warning, 4 info, 5 de
 **4 (Info)** is the one to run with — what was collected, what was delivered, and anything refused.
 **5 (Debug)** adds a line per cycle and per push. The stock `Appender.Console` is itself capped at
 Info, so Debug lines reach `Server.log` and not the console until that is raised too.
+
+## Finding a character that has died
+
+A hardcore death **deletes the character**. The realm forgets it, the character cache stops answering
+to its name, and eventually the `characters` row is purged outright — so asking the realm about a
+dead donor or recipient gets the same answer as asking about a name nobody ever used.
+
+That is not good enough for a card that has to tell "this person died" apart from "you typed the name
+wrong", so the module falls back to the challenge-modes table, which keeps a row per character with
+its name, class, level and how it ended, long after the realm has let go.
+
+That lookup is `WHERE name = ? ORDER BY guid DESC LIMIT 1`, and it only runs when the realm has no
+character by that name — a death, or a typo. It leans on the index challenge-modes keeps on `name`;
+without one the query walks most of the table, which on a realm with 23k rows is milliseconds rather
+than microseconds, on the world thread.
+
+**The living character always wins.** Names are reused heavily, so a name whose previous holder died
+and whose current holder is alive must resolve to the living one. The character cache is asked first,
+and only when the realm has no such character does the challenge table answer, with the most recent
+record. Nothing is ever delivered to a character the realm no longer has, whatever its record says:
+the mail would go to a box nobody can open.
 
 ## Refusals
 

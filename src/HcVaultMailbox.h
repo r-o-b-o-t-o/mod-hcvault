@@ -8,6 +8,7 @@
 
 namespace HcVault
 {
+    struct Config;
     class Stock;
 
     /// One stack attached to the mail a letter came in.
@@ -30,6 +31,17 @@ namespace HcVault
         /// Sender's character name. Empty when the mail was not sent by a player, which the website
         /// shows as an unnamed sender rather than inventing one.
         std::string Sender;
+
+        /// What the realm knew about the sender when the letter was collected.
+        ///
+        /// Kept rather than looked up later, because a hardcore death deletes the character and the
+        /// row is purged in time — by the time somebody reads the letter there may be nothing left to
+        /// ask. Class and level are 0 when unknown; HasChallenge is false when they ran none.
+        uint8 SenderClass = 0;
+        uint8 SenderLevel = 0;
+        bool SenderHasChallenge = false;
+        int32 SenderChallenge = 0;
+        bool SenderDead = false;
 
         std::string Subject;
         std::string Body;
@@ -64,7 +76,7 @@ namespace HcVault
     ///
     /// Must run on the world thread, and only while the vault character is offline: a logged-in
     /// player holds its mail in memory and would save its own view of the mailbox back over this.
-    ScanResult CollectDonations(uint32 vaultCharacterGuid, Stock& stock);
+    ScanResult CollectDonations(Config const& config, uint32 vaultCharacterGuid, Stock& stock);
 }
 
 #endif // MOD_HCVAULT_MAILBOX_H

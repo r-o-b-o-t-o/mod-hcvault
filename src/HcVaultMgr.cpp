@@ -265,7 +265,7 @@ namespace HcVault
         std::string letterIds;
         bool const haveLetters = BuildLetterPayload(letters, letterIds);
 
-        ScanResult const scan = CollectDonations(_config.VaultCharacterGuid, _stock);
+        ScanResult const scan = CollectDonations(_config, _config.VaultCharacterGuid, _stock);
         _vaultCopper += scan.CopperCollected;
 
         // Copied once, here on the world thread, and carried through the chain. `_http` itself is
@@ -346,8 +346,9 @@ namespace HcVault
     bool Mgr::BuildLetterPayload(std::string& payload, std::string& mailIds) const
     {
         QueryResult result = CharacterDatabase.Query(
-            "SELECT mail_id, sender, subject, body, money, sent_at FROM mod_hcvault_letter "
-            "ORDER BY mail_id LIMIT 100");
+            "SELECT mail_id, sender, subject, body, money, sent_at, "
+            "sender_class, sender_level, sender_challenge, sender_dead "
+            "FROM mod_hcvault_letter ORDER BY mail_id LIMIT 100");
 
         if (!result)
             return false;
@@ -363,6 +364,9 @@ namespace HcVault
             Field* fields = result->Fetch();
             uint32 const mailId = fields[0].Get<uint32>();
 
+            uint8 const senderClass = fields[6].Get<uint8>();
+            uint8 const senderLevel = fields[7].Get<uint8>();
+
             position[mailId] = messages.size();
             messages.push_back({
                 { "mailId", mailId },
@@ -371,6 +375,12 @@ namespace HcVault
                 { "body", fields[3].Get<std::string>() },
                 { "copper", fields[4].Get<uint32>() },
                 { "sentAt", IsoTime(fields[5].Get<uint32>()) },
+                // Null rather than 0 for what is simply not known: a letter from something that is
+                // not a player has no class, and 0 is a real class id in some other context.
+                { "senderClass", senderClass != 0 ? json(senderClass) : json(nullptr) },
+                { "senderLevel", senderLevel != 0 ? json(senderLevel) : json(nullptr) },
+                { "senderChallenge", fields[8].IsNull() ? json(nullptr) : json(fields[8].Get<int8>()) },
+                { "senderDead", fields[9].Get<uint8>() != 0 },
                 { "items", json::array() },
             });
 
@@ -543,6 +553,33 @@ namespace HcVault
             }
         }
 
+        json replyResults = json::array();
+
+        for (json const& entry : work.value("replies", json::array()))
+        {
+            Reply reply;
+            reply.ReplyId = entry.value("replyId", 0);
+            reply.Recipient = entry.value("recipient", std::string());
+            reply.Subject = entry.value("subject", std::string());
+            reply.Body = entry.value("body", std::string());
+
+            if (reply.ReplyId == 0 || reply.Recipient.empty())
+            {
+                LOG_WARN("module.hcvault", "[HCVault] Skipping a reply with no id or recipient.");
+                continue;
+            }
+
+            ReplyOutcome const outcome = SendReply(_config, reply);
+
+            json result;
+            result["replyId"] = outcome.ReplyId;
+            result["sent"] = outcome.Sent;
+            if (!outcome.Reason.empty())
+                result["reason"] = outcome.Reason;
+
+            replyResults.push_back(std::move(result));
+        }
+
         for (json const& entry : work.value("recipients", json::array()))
         {
             RecipientRequest request;
@@ -557,14 +594,16 @@ namespace HcVault
             recipientResults.push_back({
                 { "orderId", info.OrderId },
                 { "exists", info.Exists },
+                { "live", info.Live },
                 { "level", info.HasLevel ? json(info.Level) : json(nullptr) },
+                { "class", info.HasClass ? json(info.Class) : json(nullptr) },
                 { "challenge", info.HasChallenge ? json(info.Challenge) : json(nullptr) },
                 { "eligible", info.Eligible },
                 { "dead", info.Dead },
             });
         }
 
-        if (deliveryResults.empty() && recipientResults.empty())
+        if (deliveryResults.empty() && recipientResults.empty() && replyResults.empty())
         {
             EndCycle();
             return;
@@ -577,6 +616,7 @@ namespace HcVault
         json payload;
         payload["deliveries"] = std::move(deliveryResults);
         payload["recipients"] = std::move(recipientResults);
+        payload["replies"] = std::move(replyResults);
 
         PushResults(http, payload.dump());
 

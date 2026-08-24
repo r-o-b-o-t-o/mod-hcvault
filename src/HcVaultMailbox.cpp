@@ -1,9 +1,10 @@
 #include "HcVaultMailbox.h"
 
-#include "CharacterCache.h"
 #include "DatabaseEnv.h"
 #include "Field.h"
 #include "GameTime.h"
+#include "HcVaultCharacters.h"
+#include "HcVaultConfig.h"
 #include "HcVaultStock.h"
 #include "Item.h"
 #include "Log.h"
@@ -161,22 +162,28 @@ namespace HcVault
             return value;
         }
 
-        std::string SenderName(MailRow const& mail)
+        /// What the realm knows about whoever sent a mail, from what was resolved for the whole box.
+        ///
+        /// Only a player mail carries a character guid in `sender`; for creature or auction mail the
+        /// column is an entry id, and naming a character from it would be a lie.
+        ///
+        /// Resolved rather than read from the character cache, because a donor who has since died is
+        /// no longer in it — and a letter from somebody who died right after sending it is exactly the
+        /// one worth being able to read.
+        ResolvedCharacter SenderOf(
+            std::unordered_map<uint32, ResolvedCharacter> const& senders, MailRow const& mail)
         {
-            // Only a player mail carries a character guid in `sender`; for creature or auction mail
-            // the column is an entry id and naming a character from it would be a lie.
             if (mail.MessageType != MAIL_NORMAL)
                 return {};
 
-            std::string name;
-            if (sCharacterCache->GetCharacterNameByGuid(ObjectGuid(HighGuid::Player, mail.Sender), name))
-                return name;
+            if (auto const itr = senders.find(mail.Sender); itr != senders.end())
+                return itr->second;
 
             return {};
         }
     }
 
-    ScanResult CollectDonations(uint32 vaultCharacterGuid, Stock& stock)
+    ScanResult CollectDonations(Config const& config, uint32 vaultCharacterGuid, Stock& stock)
     {
         ScanResult result;
 
@@ -239,6 +246,19 @@ namespace HcVault
         }
 
         std::unordered_map<uint32, std::unique_ptr<Item>> loadedItems = LoadMailedItems(wanted);
+
+        // Every letter's sender in one go, for the same reason the attachments above are read that
+        // way. One lookup per letter was a synchronous round trip per letter on the world thread —
+        // some fourteen milliseconds for a full box of a hundred, spent inside the transaction that
+        // empties it.
+        std::vector<uint32> senderGuids;
+        for (MailRow const& mail : rows)
+        {
+            if (mail.Cod == 0 && mail.MessageType == MAIL_NORMAL && !mail.Body.empty())
+                senderGuids.push_back(mail.Sender);
+        }
+
+        std::unordered_map<uint32, ResolvedCharacter> const senders = ResolveByGuids(config, senderGuids);
 
         for (MailRow const& mail : rows)
         {
@@ -321,9 +341,16 @@ namespace HcVault
 
             if (!mail.Body.empty())
             {
+                ResolvedCharacter const sender = SenderOf(senders, mail);
+
                 CollectedLetter letter;
                 letter.MailId = mail.Id;
-                letter.Sender = SenderName(mail);
+                letter.Sender = sender.Name;
+                letter.SenderClass = sender.Class;
+                letter.SenderLevel = sender.Level;
+                letter.SenderHasChallenge = sender.HasChallenge;
+                letter.SenderChallenge = sender.Challenge;
+                letter.SenderDead = sender.Dead;
                 letter.Subject = TruncateUtf8(mail.Subject, kMaxSubjectBytes);
                 letter.Body = TruncateUtf8(mail.Body, kMaxBodyBytes);
 
@@ -343,10 +370,16 @@ namespace HcVault
                 // Buffered in the same transaction that deletes the mail. The letter has to outlive
                 // the mail it came in, and a push that fails must not be the thing that loses it.
                 trans->Append(
-                    "REPLACE INTO mod_hcvault_letter (mail_id, sender, subject, body, money, sent_at) "
-                    "VALUES ({}, '{}', '{}', '{}', {}, {})",
+                    "REPLACE INTO mod_hcvault_letter "
+                    "(mail_id, sender, sender_class, sender_level, sender_challenge, sender_dead, "
+                    " subject, body, money, sent_at) "
+                    "VALUES ({}, '{}', {}, {}, {}, {}, '{}', '{}', {}, {})",
                     letter.MailId,
                     EscapeForSql(letter.Sender),
+                    letter.SenderClass,
+                    letter.SenderLevel,
+                    letter.SenderHasChallenge ? std::to_string(letter.SenderChallenge) : "NULL",
+                    letter.SenderDead ? 1 : 0,
                     EscapeForSql(letter.Subject),
                     EscapeForSql(letter.Body),
                     letter.Copper,
