@@ -498,6 +498,16 @@ namespace HcVault
             return;
         }
 
+        // Valid JSON can still be the wrong shape. json::value throws on anything but an object, and on
+        // a field of the wrong type, which is why each entry below is read inside a try of its own: an
+        // exception let out of here would take the worldserver down.
+        if (!work.is_object())
+        {
+            LOG_ERROR("module.hcvault", "[HCVault] The website's work list is not a JSON object: {}", Excerpt(body));
+            EndCycle();
+            return;
+        }
+
         // The vault character can log in between the cycle starting and the answer arriving, which is
         // the moment it becomes unsafe to mail anything out of its purse.
         if (VaultCharacterIsOnline())
@@ -549,8 +559,34 @@ namespace HcVault
         for (json const& entry : work.value("deliveries", json::array()))
         {
             Delivery delivery;
-            delivery.OrderId = entry.value("orderId", 0);
-            std::string const reference = entry.value("reference", std::string());
+            std::string reference;
+
+            // Read whole before any of it is acted on, so an entry of the wrong shape is skipped rather
+            // than half delivered.
+            try
+            {
+                delivery.OrderId = entry.value("orderId", 0);
+                reference = entry.value("reference", std::string());
+                delivery.Recipient = entry.value("recipient", std::string());
+                delivery.Copper = entry.value("copper", 0ULL);
+
+                for (json const& line : entry.value("items", json::array()))
+                {
+                    DeliveryLine item;
+                    item.LineId = line.value("lineId", 0);
+                    item.ItemId = line.value("itemId", 0U);
+                    item.SuffixId = line.value("suffixId", 0);
+                    item.Quantity = line.value("quantity", 0U);
+                    delivery.Items.push_back(item);
+                }
+            }
+            catch (json::exception const& e)
+            {
+                LOG_WARN("module.hcvault", "[HCVault] Skipping a delivery the module could not read: {} — {}",
+                    e.what(), Excerpt(entry.dump()));
+                continue;
+            }
+
             delivery.Reference = SanitiseReference(reference);
 
             // Said out loud, because nothing else would: the mail goes out without its reference in
@@ -561,18 +597,6 @@ namespace HcVault
                 LOG_WARN("module.hcvault",
                     "[HCVault] Order {} came with a reference that is not 1-16 letters or digits ({}); "
                     "delivering it without one.", delivery.OrderId, Excerpt(reference, 40));
-            }
-            delivery.Recipient = entry.value("recipient", std::string());
-            delivery.Copper = entry.value("copper", 0ULL);
-
-            for (json const& line : entry.value("items", json::array()))
-            {
-                DeliveryLine item;
-                item.LineId = line.value("lineId", 0);
-                item.ItemId = line.value("itemId", 0U);
-                item.SuffixId = line.value("suffixId", 0);
-                item.Quantity = line.value("quantity", 0U);
-                delivery.Items.push_back(item);
             }
 
             if (delivery.OrderId == 0 || delivery.Recipient.empty())
@@ -609,10 +633,20 @@ namespace HcVault
         for (json const& entry : work.value("replies", json::array()))
         {
             Reply reply;
-            reply.ReplyId = entry.value("replyId", 0);
-            reply.Recipient = entry.value("recipient", std::string());
-            reply.Subject = entry.value("subject", std::string());
-            reply.Body = entry.value("body", std::string());
+
+            try
+            {
+                reply.ReplyId = entry.value("replyId", 0);
+                reply.Recipient = entry.value("recipient", std::string());
+                reply.Subject = entry.value("subject", std::string());
+                reply.Body = entry.value("body", std::string());
+            }
+            catch (json::exception const& e)
+            {
+                LOG_WARN("module.hcvault", "[HCVault] Skipping a reply the module could not read: {} — {}",
+                    e.what(), Excerpt(entry.dump()));
+                continue;
+            }
 
             if (reply.ReplyId == 0 || reply.Recipient.empty())
             {
@@ -634,8 +668,18 @@ namespace HcVault
         for (json const& entry : work.value("recipients", json::array()))
         {
             RecipientRequest request;
-            request.OrderId = entry.value("orderId", 0);
-            request.Recipient = entry.value("recipient", std::string());
+
+            try
+            {
+                request.OrderId = entry.value("orderId", 0);
+                request.Recipient = entry.value("recipient", std::string());
+            }
+            catch (json::exception const& e)
+            {
+                LOG_WARN("module.hcvault", "[HCVault] Skipping a recipient the module could not read: {} — {}",
+                    e.what(), Excerpt(entry.dump()));
+                continue;
+            }
 
             if (request.OrderId == 0 || request.Recipient.empty())
                 continue;
