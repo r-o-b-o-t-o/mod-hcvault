@@ -422,7 +422,10 @@ namespace HcVault
         json document;
         document["messages"] = std::move(messages);
 
-        payload = document.dump();
+        // Replaced rather than thrown on. A letter's text is whatever the sender's client put in the
+        // packet, and a byte sequence MySQL stored but json will not encode would throw here on the
+        // world thread, every cycle, for as long as the letter waited to be pushed.
+        payload = document.dump(-1, ' ', false, json::error_handler_t::replace);
         mailIds = std::move(ids);
         return true;
     }
