@@ -581,11 +581,8 @@ namespace HcVault
                 continue;
             }
 
-            for (DeliveryOutcome outcome : DeliverOrder(_config, _stock, delivery, availableCopper))
-            {
-                outcome.Reference = delivery.Reference;
+            for (DeliveryOutcome const& outcome : DeliverOrder(_config, _stock, delivery, availableCopper))
                 report(outcome);
-            }
         }
 
         // Deliveries the website has not acknowledged, asked about or not. A line the operator took

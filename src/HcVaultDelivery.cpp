@@ -137,13 +137,15 @@ namespace HcVault
             for (DeliveryLine const& line : delivery.Items)
             {
                 bool const sent = alreadyDelivered.count(line.LineId) != 0;
-                outcomes.push_back({ delivery.OrderId, line.LineId, false, sent, sent ? std::string() : reason });
+                outcomes.push_back({ delivery.OrderId, line.LineId, false, sent, sent ? std::string() : reason,
+                    delivery.Reference });
             }
 
             if (delivery.Copper > 0)
             {
                 bool const sent = alreadyDelivered.count(kMoneyLineId) != 0;
-                outcomes.push_back({ delivery.OrderId, kMoneyLineId, true, sent, sent ? std::string() : reason });
+                outcomes.push_back({ delivery.OrderId, kMoneyLineId, true, sent, sent ? std::string() : reason,
+                    delivery.Reference });
             }
 
             return outcomes;
@@ -324,7 +326,7 @@ namespace HcVault
                 LOG_INFO("module.hcvault",
                     "[HCVault] Order {} line {} was already delivered; reporting it again rather than resending.",
                     delivery.OrderId, line.LineId);
-                outcomes.push_back({ delivery.OrderId, line.LineId, false, true, {} });
+                outcomes.push_back({ delivery.OrderId, line.LineId, false, true, {}, delivery.Reference });
                 continue;
             }
 
@@ -345,7 +347,7 @@ namespace HcVault
             {
                 outcomes.push_back({ delivery.OrderId, line.LineId, false, false,
                     "this is " + std::to_string(slots) + " stacks and one mail holds "
-                    + std::to_string(kMailItemLimit) + "; order it in smaller amounts" });
+                    + std::to_string(kMailItemLimit) + "; order it in smaller amounts", delivery.Reference });
                 continue;
             }
 
@@ -360,7 +362,7 @@ namespace HcVault
 
             if (!claimedOk)
             {
-                outcomes.push_back({ delivery.OrderId, line.LineId, false, false, error });
+                outcomes.push_back({ delivery.OrderId, line.LineId, false, false, error, delivery.Reference });
                 continue;
             }
 
@@ -369,13 +371,13 @@ namespace HcVault
 
         bool sendMoney = delivery.Copper > 0 && !alreadyDelivered.count(kMoneyLineId);
         if (delivery.Copper > 0 && !sendMoney)
-            outcomes.push_back({ delivery.OrderId, kMoneyLineId, true, true, {} });
+            outcomes.push_back({ delivery.OrderId, kMoneyLineId, true, true, {}, delivery.Reference });
 
         if (sendMoney && availableCopper < delivery.Copper)
         {
             outcomes.push_back({ delivery.OrderId, kMoneyLineId, true, false,
                 "the vault character is carrying " + std::to_string(availableCopper / 10000)
-                + " gold, not " + std::to_string(delivery.Copper / 10000) });
+                + " gold, not " + std::to_string(delivery.Copper / 10000), delivery.Reference });
             sendMoney = false;
         }
 
@@ -412,7 +414,7 @@ namespace HcVault
                 availableCopper -= std::min(availableCopper, batch.Copper);
 
             for (int32 lineId : batch.LineIds)
-                outcomes.push_back({ delivery.OrderId, lineId, lineId == kMoneyLineId, true, {} });
+                outcomes.push_back({ delivery.OrderId, lineId, lineId == kMoneyLineId, true, {}, delivery.Reference });
         }
 
         // Queued rather than committed inline: Item::SaveToDB and the mail statements are registered
