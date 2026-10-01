@@ -31,7 +31,8 @@ namespace HcVault
     ///   3. forward any letters that came with donations         (network thread)
     ///   4. ask what to deliver and who to describe              (network thread)
     ///   5. do it                                                (world thread)
-    ///   6. report what came of it                               (network thread)
+    ///   6. report what came of it, and any delivery the website
+    ///      has not acknowledged yet                             (network thread)
     ///
     /// Steps that touch the game run on the world thread, driven from OnUpdate; steps that talk to
     /// the website run on the io_context. The only thing crossing between them is the answer to
@@ -109,7 +110,16 @@ namespace HcVault
         void PushLetters(std::shared_ptr<Net::HttpClient> http, std::string payload, std::string mailIds);
         void FetchWork(std::shared_ptr<Net::HttpClient> http);
         void HandleWork(std::string const& body);
-        void PushResults(std::shared_ptr<Net::HttpClient> http, std::string body);
+
+        /// `acknowledged` lists the delivery records the push reports, marked reported once the
+        /// website answers with a success. See MarkReported.
+        ///
+        /// `stock` is a finished stock push to send once the results have been accepted, or empty for
+        /// none. After them rather than alongside, and only after a success, because the website
+        /// debits its mirror for each delivery it applies, and a push that landed first would be
+        /// debited again.
+        void PushResults(std::shared_ptr<Net::HttpClient> http, std::string body, std::string acknowledged,
+                         std::string stock);
         void EndCycle();
 
         Config _config;

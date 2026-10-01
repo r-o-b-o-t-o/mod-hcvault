@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <ctime>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using json = nlohmann::json;
@@ -34,6 +35,11 @@ namespace HcVault
         /// The first cycle waits this long after startup, so the character cache and the rest of the
         /// world are settled before anything is mailed.
         constexpr uint32 kStartupDelayMs = 15 * 1000;
+
+        /// Unacknowledged deliveries repeated per cycle. A backlog builds while results pushes fail —
+        /// the website refusing them, or not answering at all — and drains a hundred per cycle once
+        /// they succeed again.
+        constexpr std::size_t kUnreportedBatch = 100;
 
         /// The website reads timestamps as ISO 8601; the game counts Unix seconds.
         std::string IsoTime(uint32 unixSeconds)
@@ -509,6 +515,33 @@ namespace HcVault
         json deliveryResults = json::array();
         json recipientResults = json::array();
 
+        // Every delivery this push reports, by the key of its record — acknowledged once the website
+        // has it, and used to keep a delivery from being reported twice in one push.
+        std::unordered_set<std::string> deliveredKeys;
+
+        auto report = [&deliveryResults, &deliveredKeys](DeliveryOutcome const& outcome)
+        {
+            if (outcome.Delivered && !deliveredKeys.insert(DeliveryKey(outcome)).second)
+                return false;
+
+            json result;
+            // Null rather than 0 for the money: the website's line ids start at 1, and a nullable
+            // field is how it tells the two apart.
+            result["lineId"] = outcome.IsMoney ? json(nullptr) : json(outcome.LineId);
+            result["orderId"] = outcome.OrderId;
+            result["delivered"] = outcome.Delivered;
+
+            // So the website can refuse a result about some earlier order that had this id.
+            if (!outcome.Reference.empty())
+                result["reference"] = outcome.Reference;
+
+            if (!outcome.Reason.empty())
+                result["reason"] = outcome.Reason;
+
+            deliveryResults.push_back(std::move(result));
+            return true;
+        };
+
         // The cycle's own running figure, decremented as money goes out, so two orders in one cycle
         // cannot each see the full purse and together overdraw it.
         uint64& availableCopper = _vaultCopper;
@@ -517,7 +550,18 @@ namespace HcVault
         {
             Delivery delivery;
             delivery.OrderId = entry.value("orderId", 0);
-            delivery.Reference = entry.value("reference", std::string());
+            std::string const reference = entry.value("reference", std::string());
+            delivery.Reference = SanitiseReference(reference);
+
+            // Said out loud, because nothing else would: the mail goes out without its reference in
+            // the subject, and the record falls back to being matched by id alone — the protection
+            // against a rebuilt website database quietly switched off for this order.
+            if (delivery.Reference.empty() && !reference.empty())
+            {
+                LOG_WARN("module.hcvault",
+                    "[HCVault] Order {} came with a reference that is not 1-16 letters or digits ({}); "
+                    "delivering it without one.", delivery.OrderId, Excerpt(reference, 40));
+            }
             delivery.Recipient = entry.value("recipient", std::string());
             delivery.Copper = entry.value("copper", 0ULL);
 
@@ -537,20 +581,30 @@ namespace HcVault
                 continue;
             }
 
-            for (DeliveryOutcome const& outcome : DeliverOrder(_config, _stock, delivery, availableCopper))
+            for (DeliveryOutcome outcome : DeliverOrder(_config, _stock, delivery, availableCopper))
             {
-                json result;
-                // Null rather than 0 for the money: the website's line ids start at 1, and a nullable
-                // field is how it tells the two apart.
-                result["lineId"] = outcome.IsMoney ? json(nullptr) : json(outcome.LineId);
-                result["orderId"] = outcome.OrderId;
-                result["delivered"] = outcome.Delivered;
-
-                if (!outcome.Reason.empty())
-                    result["reason"] = outcome.Reason;
-
-                deliveryResults.push_back(std::move(result));
+                outcome.Reference = delivery.Reference;
+                report(outcome);
             }
+        }
+
+        // Deliveries the website has not acknowledged, asked about or not. A line the operator took
+        // back from the queue is never offered again, so a report of it that was lost would otherwise
+        // never be repeated, and the website would go on reserving goods that are long gone.
+        //
+        // Anything this cycle mailed is skipped by the key check: its record may or may not have
+        // landed by now, and it is already in the push either way.
+        std::size_t repeated = 0;
+        for (DeliveryOutcome const& outcome : UnreportedDeliveries(kUnreportedBatch))
+        {
+            if (report(outcome))
+                ++repeated;
+        }
+
+        if (repeated > 0)
+        {
+            LOG_INFO("module.hcvault", "[HCVault] Repeating {} delivery report(s) the website has not acknowledged.",
+                repeated);
         }
 
         json replyResults = json::array();
@@ -609,43 +663,74 @@ namespace HcVault
             return;
         }
 
-        // The vault changed, so the website's mirror is now a cycle behind. Pushed again rather than
-        // left until the next cycle, so what the public page offers matches what is on the shelves.
-        bool const stockChanged = !deliveryResults.empty();
+        bool const anyDeliveries = !deliveryResults.empty();
 
         json payload;
         payload["deliveries"] = std::move(deliveryResults);
         payload["recipients"] = std::move(recipientResults);
         payload["replies"] = std::move(replyResults);
 
-        PushResults(http, payload.dump());
-
-        if (stockChanged)
+        std::string acknowledged;
+        for (std::string const& key : deliveredKeys)
         {
-            // Built here on the world thread, where the stock may be read, and posted from the
-            // callback thread as a finished string.
-            http->Post(kStockPath, BuildStockPayload(), [](Net::Response response)
-            {
-                if (!response.Ok)
-                    LOG_WARN("module.hcvault", "[HCVault] Post-delivery stock push failed: {}", response.Error);
-            });
+            if (!acknowledged.empty())
+                acknowledged += ',';
+
+            acknowledged += key;
         }
+
+        // A fresh picture of the vault to follow the results whenever they carry a delivery — a
+        // repeated one included. The vault itself only changed if something was mailed this cycle,
+        // but the website takes every delivery it applies out of its mirror, and for one it hears
+        // about late the goods were already gone from the last push: the mirror ends up short by
+        // them until a push puts it right.
+        //
+        // Built here on the world thread, where the stock may be read, and posted as a finished
+        // string once the results have been accepted. See PushResults for why only then.
+        std::string stock = anyDeliveries ? BuildStockPayload() : std::string();
+
+        PushResults(http, payload.dump(), std::move(acknowledged), std::move(stock));
     }
 
-    void Mgr::PushResults(std::shared_ptr<Net::HttpClient> http, std::string body)
+    void Mgr::PushResults(std::shared_ptr<Net::HttpClient> http, std::string body, std::string acknowledged,
+                          std::string stock)
     {
-        http->Post(kResultsPath, std::move(body), [this](Net::Response response)
+        http->Post(kResultsPath, std::move(body),
+            [this, http, acknowledged = std::move(acknowledged), stock = std::move(stock)]
+            (Net::Response response) mutable
         {
             if (!response.Ok)
             {
-                // The lines that were mailed are recorded in mod_hcvault_delivery, so the website will
-                // offer them again and they will be reported delivered without being resent.
+                // Every delivery in the push stays unacknowledged in mod_hcvault_delivery, so the next
+                // cycle reports it again whether or not the website offers its line. Nothing is resent:
+                // the record is what says it already went.
                 LOG_WARN("module.hcvault", "[HCVault] Could not report results, they will be repeated next cycle: {}",
                     response.Error);
             }
             else
             {
+                // Only on a success. A push the website never answered may still have been applied,
+                // but repeating a delivery is harmless and losing one is not.
+                MarkReported(acknowledged);
                 LOG_DEBUG("module.hcvault", "[HCVault] Results accepted: {}", Excerpt(response.Body));
+
+                // Only after a success, because only then is the order certain. The website answers
+                // once it has applied the results, so the push lands after their debits and has the
+                // last word on the mirror. A push sent after a timeout could overtake results the
+                // website is still applying, and be debited again for what it already left out.
+                //
+                // Waiting after a failure never puts mailed goods back on offer. A line the website
+                // has not heard about stays reserved, and one it applied before the answer was lost
+                // has been debited — at worst twice, if it was a repeat, which errs low. The next
+                // cycle opens with a push of its own either way.
+                if (!stock.empty())
+                {
+                    http->Post(kStockPath, std::move(stock), [](Net::Response stockResponse)
+                    {
+                        if (!stockResponse.Ok)
+                            LOG_WARN("module.hcvault", "[HCVault] Post-delivery stock push failed: {}", stockResponse.Error);
+                    });
+                }
             }
 
             EndCycle();

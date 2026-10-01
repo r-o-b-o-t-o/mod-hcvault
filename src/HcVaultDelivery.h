@@ -3,6 +3,7 @@
 
 #include "Define.h"
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,12 @@ namespace HcVault
 
         /// The short reference the website showed whoever placed the order. It goes in the mail's
         /// subject, so a parcel in game can be matched to a card in the backoffice. May be empty.
+        ///
+        /// It is also what tells this order apart from another with the same id. The website's ids
+        /// start again from 1 when its database is rebuilt; references are drawn from an opaque id
+        /// and do not. So the delivery record keeps it, and every result carries it back.
+        ///
+        /// Only letters and digits, as SanitiseReference leaves it: it is written into SQL by hand.
         std::string Reference;
 
         std::string Recipient;
@@ -47,7 +54,16 @@ namespace HcVault
 
         /// Why not, phrased for whoever reads the order card. Empty on success.
         std::string Reason;
+
+        /// The order's reference, so the website can refuse a result meant for another order that
+        /// had the same id. See Delivery::Reference.
+        std::string Reference;
     };
+
+    /// What a reference from the website may contain before it is stored or sent anywhere: letters
+    /// and digits, at most 16 of them. Anything else comes back empty, which is how the website's
+    /// own eight hex digits always pass and nothing it could send can reach a statement unescaped.
+    std::string SanitiseReference(std::string const& reference);
 
     /// A reply the operator wrote to a donation letter, waiting to be posted.
     ///
@@ -130,8 +146,8 @@ namespace HcVault
     /// The whole order is one transaction: the goods leaving the vault, the mail carrying them, the
     /// money and the delivery records land together or not at all. Delivery is therefore recorded at
     /// the same instant the goods move, so a report lost on the way back to the website cannot cause
-    /// them to be sent twice — the next attempt recognises the line and reports it delivered without
-    /// touching the vault.
+    /// them to be sent twice — a later attempt recognises the line and reports it delivered without
+    /// touching the vault, and UnreportedDeliveries repeats the report even if no attempt comes.
     ///
     /// `availableCopper` is the vault character's purse for this cycle, seeded once by the caller and
     /// decremented as money goes out. Threaded through rather than re-read per order because the
@@ -141,6 +157,29 @@ namespace HcVault
     /// Must run on the world thread, with the vault character offline.
     std::vector<DeliveryOutcome> DeliverOrder(Config const& config, Stock& stock, Delivery const& delivery,
                                               uint64& availableCopper);
+
+    /// Deliveries on record that the website has not acknowledged yet, oldest first, at most `limit`.
+    /// Every one comes back as delivered.
+    ///
+    /// Reported every cycle until a results push carrying them succeeds, whether the website asked
+    /// about them or not. Waiting to be asked is not enough: the website stops offering a line the
+    /// operator takes back from the queue, and a lost report for one would then never be repeated.
+    ///
+    /// Must run on the world thread: it reads the database synchronously.
+    std::vector<DeliveryOutcome> UnreportedDeliveries(std::size_t limit);
+
+    /// One delivered outcome as an `(order_id, line_id, reference)` tuple, the key of its delivery
+    /// record.
+    std::string DeliveryKey(DeliveryOutcome const& outcome);
+
+    /// Records that the website has acknowledged these deliveries, so they stop being reported.
+    /// `keys` is a comma-separated list of DeliveryKey tuples.
+    ///
+    /// Queued on the async connection rather than run, so it is safe to call from a network thread.
+    /// That queue can run it before the transaction that wrote a record has landed, when the worker
+    /// pool has more than one thread; the record is then reported once more, and the website ignores
+    /// a delivery it already has.
+    void MarkReported(std::string const& keys);
 
     /// Reads what the vault character is carrying, in copper.
     uint64 ReadVaultMoney(uint32 vaultCharacterGuid);

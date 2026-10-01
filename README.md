@@ -25,7 +25,8 @@ One cycle, every `HcVault.PollInterval` seconds:
    `Hardcore Vault Order #237b142d`. Any replies the operator has written go out in the same pass.
    Recipients are looked up: name, class and level from the character cache, challenge mode from the
    challenge-modes table, and both from that table alone when the character has died.
-6. **Report.** What came of it goes back, along with a fresh stock push if anything moved.
+6. **Report.** What came of it goes back, along with any earlier delivery the website has not
+   acknowledged yet, and a fresh stock push if anything moved.
 
 **The whole cycle is skipped while the vault character is online.** A logged-in player holds its mail
 and its purse in memory and writes both back when it saves, which would undo anything done underneath
@@ -81,7 +82,7 @@ All in the characters database; see `data/sql/db-characters/`.
 | Table | Holds |
 | --- | --- |
 | `mod_hcvault_stock` | One row per `item_instance` the vault is holding |
-| `mod_hcvault_delivery` | Order lines already mailed. This is what makes delivery exactly-once |
+| `mod_hcvault_delivery` | Order lines already mailed, under the order's reference, and whether the website has acknowledged each. This is what makes delivery exactly-once |
 | `mod_hcvault_letter` | Donation letters not yet accepted by the website |
 | `mod_hcvault_letter_item` | What came attached to those letters. Cascaded from the letter |
 | `mod_hcvault_reply` | Replies already mailed. Exactly-once, the same way deliveries are |
@@ -93,9 +94,23 @@ out of the vault. One transaction covers a whole order, so "the goods left the v
 carrying them exists" and "we know they left" are one fact rather than three that a crash could
 separate.
 
-If the report back to the website is lost — a timeout, a restart, the site being down — the website
-still has the line as approved and offers it again on the next poll. The module recognises it, skips
-the vault entirely, and reports it delivered. The goods are never sent twice.
+If the report back to the website is lost — a timeout, a restart, the site being down — the row is
+what repeats it. It is written unacknowledged, and every cycle that gets as far as reporting, up to a
+hundred unacknowledged deliveries ride along with the results push, asked about or not; a row is
+marked acknowledged only once a push carrying it is answered with a success. The website cannot be relied on to ask again:
+the operator can take an approved line back to pending, after which it is never offered, and a lost
+report for it would otherwise leave the website reserving goods that are already in somebody's
+mailbox.
+
+A line the website does offer again is recognised the same way: the module skips the vault entirely
+and reports it delivered. The goods are never sent twice, and the website ignores a repeat for a line
+it already has as sent.
+
+The row also keeps the order's reference — the `#237b142d` in the mail subject — and every result
+carries it back. The website's ids start again from 1 if its database is rebuilt, so an id alone can
+name two different orders; the reference cannot. A record only counts for the order it was made for,
+and the website refuses a result whose reference is not the order's. Records older than the column
+have no reference and are matched by id, as they always were.
 
 This is also why a line has to fit in one mail. Spread over two, a crash between them would leave
 goods sent with no record, and the retry would send them again. A line needing more than 12 mail

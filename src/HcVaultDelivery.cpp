@@ -37,12 +37,18 @@ namespace HcVault
         }
 
         /// Line ids of this order already recorded as delivered.
-        std::unordered_set<int32> AlreadyDelivered(int32 orderId)
+        ///
+        /// Matched on the reference as well as the id, so an order the website created after its
+        /// database was rebuilt is not taken for an older one that had the same id — which would
+        /// report its lines delivered without anything being sent. A record with no reference was
+        /// written before references were kept, and is matched on the id alone as it always was.
+        std::unordered_set<int32> AlreadyDelivered(int32 orderId, std::string const& reference)
         {
             std::unordered_set<int32> delivered;
 
             if (QueryResult result = CharacterDatabase.Query(
-                    "SELECT line_id FROM mod_hcvault_delivery WHERE order_id = {}", orderId))
+                    "SELECT line_id FROM mod_hcvault_delivery WHERE order_id = {} AND reference IN ('{}', '')",
+                    orderId, reference))
             {
                 do
                 {
@@ -95,9 +101,9 @@ namespace HcVault
             for (int32 lineId : batch.LineIds)
             {
                 trans->Append(
-                    "INSERT INTO mod_hcvault_delivery (order_id, line_id, sent_at) VALUES ({}, {}, {}) "
-                    "ON DUPLICATE KEY UPDATE sent_at = sent_at",
-                    orderId, lineId, now);
+                    "INSERT INTO mod_hcvault_delivery (order_id, line_id, reference, sent_at) "
+                    "VALUES ({}, {}, '{}', {}) ON DUPLICATE KEY UPDATE sent_at = sent_at",
+                    orderId, lineId, delivery.Reference, now);
             }
 
             Player* online = ObjectAccessor::FindPlayerByLowGUID(recipientGuid);
@@ -251,7 +257,7 @@ namespace HcVault
     {
         // Read first, because it outranks every refusal below: what has already been mailed has already
         // been mailed.
-        auto const alreadyDelivered = AlreadyDelivered(delivery.OrderId);
+        auto const alreadyDelivered = AlreadyDelivered(delivery.OrderId, delivery.Reference);
 
         RecipientRequest describe;
         describe.OrderId = delivery.OrderId;
@@ -422,5 +428,81 @@ namespace HcVault
             delivery.OrderId, delivery.Recipient, outcomes.size(), batches.size());
 
         return outcomes;
+    }
+
+    std::vector<DeliveryOutcome> UnreportedDeliveries(std::size_t limit)
+    {
+        std::vector<DeliveryOutcome> outcomes;
+
+        if (QueryResult result = CharacterDatabase.Query(
+                "SELECT order_id, line_id, reference FROM mod_hcvault_delivery WHERE reported = 0 "
+                "ORDER BY sent_at LIMIT {}", limit))
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+                int32 const orderId = fields[0].Get<int32>();
+                int32 const lineId = fields[1].Get<int32>();
+                std::string const stored = fields[2].Get<std::string>();
+
+                // Checked again on the way out, though it was on the way in: the row is the one place
+                // it could have been changed by hand, and it goes straight back into SQL.
+                //
+                // One that fails is given up on rather than repeated. Sent without its reference, the
+                // website would believe it on the id alone — the very guess the reference is there to
+                // stop — and it could never be acknowledged either, since the key it would be sent
+                // under is not the one it is stored under. It would take a place in every batch for
+                // good. Marked acknowledged under its own key, escaped, and said so.
+                if (SanitiseReference(stored) != stored)
+                {
+                    std::string escaped = stored;
+                    CharacterDatabase.EscapeString(escaped);
+                    CharacterDatabase.Execute(
+                        "UPDATE mod_hcvault_delivery SET reported = 1 "
+                        "WHERE order_id = {} AND line_id = {} AND reference = '{}'",
+                        orderId, lineId, escaped);
+
+                    LOG_WARN("module.hcvault",
+                        "[HCVault] Delivery record for order {} line {} has a reference this module would "
+                        "not have written; it will not be reported.", orderId, lineId);
+                    continue;
+                }
+
+                outcomes.push_back({ orderId, lineId, lineId == kMoneyLineId, true, {}, stored });
+            } while (result->NextRow());
+        }
+
+        return outcomes;
+    }
+
+    std::string DeliveryKey(DeliveryOutcome const& outcome)
+    {
+        int32 const lineId = outcome.IsMoney ? kMoneyLineId : outcome.LineId;
+        return "(" + std::to_string(outcome.OrderId) + "," + std::to_string(lineId) + ",'"
+            + outcome.Reference + "')";
+    }
+
+    void MarkReported(std::string const& keys)
+    {
+        if (keys.empty())
+            return;
+
+        CharacterDatabase.Execute(
+            "UPDATE mod_hcvault_delivery SET reported = 1 WHERE (order_id, line_id, reference) IN ({})", keys);
+    }
+
+    std::string SanitiseReference(std::string const& reference)
+    {
+        if (reference.size() > 16)
+            return {};
+
+        // Spelled out rather than std::isalnum, which follows the global locale and can let a byte
+        // above 127 through under some of them.
+        bool const clean = std::all_of(reference.begin(), reference.end(), [](char c)
+        {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        });
+
+        return clean ? reference : std::string();
     }
 }
