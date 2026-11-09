@@ -639,6 +639,7 @@ namespace HcVault
             try
             {
                 reply.ReplyId = entry.value("replyId", 0);
+                reply.Token = entry.value("token", std::string());
                 reply.Recipient = entry.value("recipient", std::string());
                 reply.Subject = entry.value("subject", std::string());
                 reply.Body = entry.value("body", std::string());
@@ -660,11 +661,60 @@ namespace HcVault
 
             json result;
             result["replyId"] = outcome.ReplyId;
+
+            // Left out rather than empty when there is none: the website believes a result with no
+            // token on its id, and would refuse an empty one as not the reply's own.
+            if (!outcome.Token.empty())
+                result["token"] = outcome.Token;
+
             result["sent"] = outcome.Sent;
             if (!outcome.Reason.empty())
                 result["reason"] = outcome.Reason;
 
             replyResults.push_back(std::move(result));
+        }
+
+        json outgoingResults = json::array();
+
+        for (json const& entry : work.value("outgoing", json::array()))
+        {
+            OutgoingMail mail;
+
+            try
+            {
+                mail.OutgoingId = entry.value("outgoingId", 0);
+                mail.Token = entry.value("token", std::string());
+                mail.Recipient = entry.value("recipient", std::string());
+                mail.Subject = entry.value("subject", std::string());
+                mail.Body = entry.value("body", std::string());
+            }
+            catch (json::exception const& e)
+            {
+                LOG_WARN("module.hcvault", "[HCVault] Skipping a mail the module could not read: {} — {}",
+                    e.what(), Excerpt(entry.dump()));
+                continue;
+            }
+
+            if (mail.OutgoingId == 0 || mail.Recipient.empty())
+            {
+                LOG_WARN("module.hcvault", "[HCVault] Skipping a mail with no id or recipient.");
+                continue;
+            }
+
+            OutgoingOutcome const outcome = SendOutgoing(_config, mail);
+
+            json result;
+            result["outgoingId"] = outcome.OutgoingId;
+
+            // Left out when there is none, for the reason a reply's is.
+            if (!outcome.Token.empty())
+                result["token"] = outcome.Token;
+
+            result["sent"] = outcome.Sent;
+            if (!outcome.Reason.empty())
+                result["reason"] = outcome.Reason;
+
+            outgoingResults.push_back(std::move(result));
         }
 
         for (json const& entry : work.value("recipients", json::array()))
@@ -700,7 +750,7 @@ namespace HcVault
             });
         }
 
-        if (deliveryResults.empty() && recipientResults.empty() && replyResults.empty())
+        if (deliveryResults.empty() && recipientResults.empty() && replyResults.empty() && outgoingResults.empty())
         {
             EndCycle();
             return;
@@ -712,6 +762,7 @@ namespace HcVault
         payload["deliveries"] = std::move(deliveryResults);
         payload["recipients"] = std::move(recipientResults);
         payload["replies"] = std::move(replyResults);
+        payload["outgoing"] = std::move(outgoingResults);
 
         std::string acknowledged;
         for (std::string const& key : deliveredKeys)

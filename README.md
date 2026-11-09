@@ -24,7 +24,8 @@ One cycle, every `HcVault.PollInterval` seconds:
 4. **Ask.** The website says which approved lines to mail and which recipients to describe.
 5. **Do.** Items are pulled out of the vault — splitting stacks where the order asks for part of one,
    and merging what comes out back into full stacks — and put in the mail, under the subject
-   `Hardcore Vault Order #237b142d`. Any replies the operator has written go out in the same pass.
+   `Hardcore Vault Order #237b142d`. Any replies and plain mails the operator has written go out in the
+   same pass; a plain mail only to a character whose challenge mode an order could go to.
    Recipients are looked up: name, class and level from the character cache, challenge mode from the
    challenge-modes table, and both from that table alone when the character has died.
 6. **Report.** What came of it goes back, along with any earlier delivery the website has not
@@ -87,7 +88,8 @@ All in the characters database; see `data/sql/db-characters/`.
 | `mod_hcvault_delivery` | Order lines already mailed, under the order's reference, and whether the website has acknowledged each. This is what makes delivery exactly-once |
 | `mod_hcvault_letter` | Donations not yet accepted by the website: sender, money, and the letter if one was written |
 | `mod_hcvault_letter_item` | What came attached to those donations. Cascaded from the row above |
-| `mod_hcvault_reply` | Replies already mailed. Exactly-once, the same way deliveries are |
+| `mod_hcvault_reply` | Replies already mailed, under the website's id and token for each. Exactly-once: a reply whose report was lost is offered again, and recognised here instead of posted twice |
+| `mod_hcvault_outgoing` | Plain mails already sent, under the website's token for each. Exactly-once, the same way replies are |
 
 ### Why the delivery table exists
 

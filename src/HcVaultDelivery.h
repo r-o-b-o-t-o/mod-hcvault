@@ -72,6 +72,13 @@ namespace HcVault
     struct Reply
     {
         int32 ReplyId = 0;
+
+        /// The website's GUID for the reply, which the record is keyed on together with the id. Unlike
+        /// the id it is never handed out again after the website's database is rebuilt. Empty from a
+        /// website too old to send one; the reply is then recorded and matched by id among records
+        /// that have no token either.
+        std::string Token;
+
         std::string Recipient;
         std::string Subject;
         std::string Body;
@@ -81,17 +88,61 @@ namespace HcVault
     struct ReplyOutcome
     {
         int32 ReplyId = 0;
+
+        /// Sent back so the website can refuse a result meant for an earlier reply with the same id.
+        /// Empty when the reply came without a usable one.
+        std::string Token;
+
         bool Sent = false;
 
         /// Why not, phrased for whoever reads the message card. Empty on success.
         std::string Reason;
     };
 
-    /// Posts one reply, recording it in `mod_hcvault_reply` in the same transaction so a report lost
-    /// on the way back cannot send it twice.
+    /// Posts one reply, recording its id and token in `mod_hcvault_reply` in the same transaction so a
+    /// report lost on the way back cannot send it twice.
     ///
     /// Must run on the world thread, with the vault character offline.
     ReplyOutcome SendReply(Config const& config, Reply const& reply);
+
+    /// A plain mail the operator wrote to a character: words only, answering nothing.
+    struct OutgoingMail
+    {
+        int32 OutgoingId = 0;
+
+        /// The website's GUID for the mail, which the record is keyed on. Unlike the id it is never
+        /// handed out again after the website's database is rebuilt. Checked for shape before use: it
+        /// is written into SQL by hand.
+        std::string Token;
+
+        std::string Recipient;
+        std::string Subject;
+        std::string Body;
+    };
+
+    /// What became of one plain mail.
+    struct OutgoingOutcome
+    {
+        int32 OutgoingId = 0;
+
+        /// Sent back so the website can refuse a result meant for an earlier mail with the same id.
+        /// Empty when the mail came without a usable one.
+        std::string Token;
+
+        bool Sent = false;
+
+        /// Why not, phrased for whoever reads the backoffice. Empty on success.
+        std::string Reason;
+    };
+
+    /// Posts one plain mail, recording its token in `mod_hcvault_outgoing` in the same transaction so a
+    /// report lost on the way back cannot send it twice.
+    ///
+    /// Unlike a reply, it goes only to a character whose challenge mode satisfies
+    /// `HcVault.AllowedChallengeMask` — the same check an order gets, though nothing is attached.
+    ///
+    /// Must run on the world thread, with the vault character offline.
+    OutgoingOutcome SendOutgoing(Config const& config, OutgoingMail const& mail);
 
     /// An order whose recipient the website wants described.
     struct RecipientRequest

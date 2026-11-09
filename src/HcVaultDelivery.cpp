@@ -12,6 +12,7 @@
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "QueryResult.h"
+#include "StringFormat.h"
 
 #include <algorithm>
 #include <unordered_set>
@@ -34,6 +35,68 @@ namespace HcVault
             // identical set of challenges, so a character carrying extra ones cannot receive the mail
             // even though its mask contains what is asked for.
             return config.ChallengeMatchExact ? challenge == mask : (challenge & mask) == mask;
+        }
+
+        /// Why the vault will not mail a character on account of its challenge mode, or empty when the
+        /// challenge is fine.
+        std::string ChallengeRefusal(Config const& config, std::string const& name, bool hasChallenge,
+                                     int32 challenge)
+        {
+            if (!hasChallenge)
+                return name + " is not running any challenge mode";
+
+            if (!ChallengeSatisfies(config, challenge))
+                return name + " runs challenge " + std::to_string(challenge)
+                    + ", and the vault only serves " + std::to_string(config.AllowedChallengeMask);
+
+            return {};
+        }
+
+        /// True when a mail's token is what the website sends — a GUID, 36 hex digits and dashes — and
+        /// so safe to write into SQL by hand.
+        bool IsWellFormedToken(std::string const& token)
+        {
+            return token.size() == 36 && std::all_of(token.begin(), token.end(), [](char c)
+            {
+                return c == '-' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            });
+        }
+
+        /// Why there is no mailbox to write to, or empty when the character is still on the realm.
+        std::string MailboxRefusal(ResolvedCharacter const& character, std::string const& name)
+        {
+            if (!character.Found)
+                return "no character named " + name + " has ever existed on this realm";
+
+            if (!character.Live)
+                return character.Dead
+                    ? name + " has died, so there is no mailbox left to write to"
+                    : name + " is no longer on the realm";
+
+            return {};
+        }
+
+        /// Posts a letter with nothing attached from the vault character, along with whatever statement
+        /// records that it went, in one transaction.
+        void PostLetter(Config const& config, uint32 recipientLow, std::string const& subject,
+                        std::string const& body, std::string const& recordSql)
+        {
+            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+            MailDraft draft(subject, body);
+
+            trans->Append(recordSql);
+
+            Player* online = ObjectAccessor::FindPlayerByLowGUID(recipientLow);
+            MailReceiver const receiver = online
+                ? MailReceiver(online, recipientLow)
+                : MailReceiver(recipientLow);
+
+            draft.SendMailTo(trans, receiver,
+                MailSender(MAIL_NORMAL, config.VaultCharacterGuid, MAIL_STATIONERY_DEFAULT),
+                MAIL_CHECK_MASK_NONE);
+
+            CharacterDatabase.CommitTransaction(trans);
         }
 
         /// Line ids of this order already recorded as delivered.
@@ -187,10 +250,32 @@ namespace HcVault
         ReplyOutcome outcome;
         outcome.ReplyId = reply.ReplyId;
 
+        // A website from before reply tokens sends none. The reply still goes out, recorded and matched
+        // by id among records with no token, as every reply used to be.
+        std::string token = reply.Token;
+        if (!token.empty() && !IsWellFormedToken(token))
+        {
+            LOG_WARN("module.hcvault",
+                "[HCVault] Reply {} came with a token that is not a GUID; sending it without one.", reply.ReplyId);
+            token.clear();
+        }
+
+        outcome.Token = token;
+
         // Already posted on an attempt whose report never arrived. Saying so again is the whole point
         // of keeping the record.
+        //
+        // Matched on the exact token as well as the id, so a reply the website wrote after its database
+        // was rebuilt is not taken for an older one that had the same id — which would report it sent
+        // without posting it.
+        //
+        // Records from before tokens have an empty one and so never match a reply that carries a token.
+        // Unlike a delivery's, they are not matched on the id alone: that would lose every reply a
+        // rebuilt website hands those ids to, while the price of not matching them is one letter posted
+        // twice — a reply sent just before the upgrade whose report was lost.
         if (QueryResult existing = CharacterDatabase.Query(
-                "SELECT 1 FROM mod_hcvault_reply WHERE reply_id = {}", reply.ReplyId))
+                "SELECT 1 FROM mod_hcvault_reply WHERE reply_id = {} AND token = '{}'",
+                reply.ReplyId, token))
         {
             LOG_INFO("module.hcvault",
                 "[HCVault] Reply {} was already sent; reporting it again rather than resending.", reply.ReplyId);
@@ -204,42 +289,72 @@ namespace HcVault
         // A reply needs somewhere to land, and that is all it needs: no challenge check and no
         // eligibility, because answering a letter is not the same as handing out goods. Somebody who
         // donated and then died deserves an answer if the character is still there to read it.
-        if (!recipient.Found)
-        {
-            outcome.Reason = "no character named " + reply.Recipient + " has ever existed on this realm";
+        outcome.Reason = MailboxRefusal(recipient, reply.Recipient);
+        if (!outcome.Reason.empty())
             return outcome;
-        }
 
-        if (!recipient.Live)
-        {
-            outcome.Reason = recipient.Dead
-                ? reply.Recipient + " has died, so there is no mailbox left to write to"
-                : reply.Recipient + " is no longer on the realm";
-            return outcome;
-        }
-
-        auto const recipientLow = recipient.Guid;
-
-        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-
-        MailDraft draft(reply.Subject, reply.Body);
-
-        trans->Append("INSERT INTO mod_hcvault_reply (reply_id, sent_at) VALUES ({}, {}) "
-                      "ON DUPLICATE KEY UPDATE sent_at = sent_at",
-            reply.ReplyId, static_cast<uint32>(GameTime::GetGameTime().count()));
-
-        Player* online = ObjectAccessor::FindPlayerByLowGUID(recipientLow);
-        MailReceiver const receiver = online
-            ? MailReceiver(online, recipientLow)
-            : MailReceiver(recipientLow);
-
-        draft.SendMailTo(trans, receiver,
-            MailSender(MAIL_NORMAL, config.VaultCharacterGuid, MAIL_STATIONERY_DEFAULT),
-            MAIL_CHECK_MASK_NONE);
-
-        CharacterDatabase.CommitTransaction(trans);
+        PostLetter(config, recipient.Guid, reply.Subject, reply.Body,
+            Acore::StringFormat("INSERT INTO mod_hcvault_reply (reply_id, token, sent_at) VALUES ({}, '{}', {}) "
+                                "ON DUPLICATE KEY UPDATE sent_at = sent_at",
+                reply.ReplyId, token, static_cast<uint32>(GameTime::GetGameTime().count())));
 
         LOG_INFO("module.hcvault", "[HCVault] Replied to {} (reply {}).", reply.Recipient, reply.ReplyId);
+
+        outcome.Sent = true;
+        return outcome;
+    }
+
+    OutgoingOutcome SendOutgoing(Config const& config, OutgoingMail const& mail)
+    {
+        OutgoingOutcome outcome;
+        outcome.OutgoingId = mail.OutgoingId;
+
+        // Without a token there is no way to tell this mail from an earlier one, so it cannot be sent
+        // exactly once. The website always sends one; this is a guard, not a path.
+        //
+        // The bad token is not echoed back. The website would refuse a result carrying it as not the
+        // mail's own, so the failure would never be counted or shown; without one, it is believed on the
+        // id, and the mail gives up with this reason on it.
+        if (!IsWellFormedToken(mail.Token))
+        {
+            outcome.Reason = "the website sent this mail without a usable token, so it was not posted";
+            return outcome;
+        }
+
+        outcome.Token = mail.Token;
+
+        // Already posted on an attempt whose report never arrived. Matched on the token rather than the
+        // id, which the website hands out again after its database is rebuilt: by id, a new mail could
+        // be taken for an old one and reported sent without being posted.
+        if (QueryResult existing = CharacterDatabase.Query(
+                "SELECT 1 FROM mod_hcvault_outgoing WHERE token = '{}'", mail.Token))
+        {
+            LOG_INFO("module.hcvault",
+                "[HCVault] Mail {} was already sent; reporting it again rather than resending.", mail.OutgoingId);
+
+            outcome.Sent = true;
+            return outcome;
+        }
+
+        ResolvedCharacter const recipient = ResolveByName(config, mail.Recipient);
+
+        outcome.Reason = MailboxRefusal(recipient, mail.Recipient);
+        if (!outcome.Reason.empty())
+            return outcome;
+
+        // Checked although nothing is attached, exactly as an order's recipient is. Death is not checked
+        // beyond the mailbox existing: HcVault.RefuseDeadRecipients is about handing out goods, and
+        // there are none here.
+        outcome.Reason = ChallengeRefusal(config, mail.Recipient, recipient.HasChallenge, recipient.Challenge);
+        if (!outcome.Reason.empty())
+            return outcome;
+
+        PostLetter(config, recipient.Guid, mail.Subject, mail.Body,
+            Acore::StringFormat("INSERT INTO mod_hcvault_outgoing (token, outgoing_id, sent_at) VALUES ('{}', {}, {}) "
+                                "ON DUPLICATE KEY UPDATE sent_at = sent_at",
+                mail.Token, mail.OutgoingId, static_cast<uint32>(GameTime::GetGameTime().count())));
+
+        LOG_INFO("module.hcvault", "[HCVault] Mailed {} (mail {}).", mail.Recipient, mail.OutgoingId);
 
         outcome.Sent = true;
         return outcome;
@@ -280,13 +395,14 @@ namespace HcVault
                 reason = info.Dead
                     ? delivery.Recipient + " has died, so there is no mailbox left to deliver to"
                     : delivery.Recipient + " is no longer on the realm";
-            else if (!info.HasChallenge)
-                reason = delivery.Recipient + " is not running any challenge mode";
-            else if (!ChallengeSatisfies(config, info.Challenge))
-                reason = delivery.Recipient + " runs challenge " + std::to_string(info.Challenge)
-                    + ", and the vault only serves " + std::to_string(config.AllowedChallengeMask);
             else
-                reason = delivery.Recipient + " is dead";
+            {
+                reason = ChallengeRefusal(config, delivery.Recipient, info.HasChallenge, info.Challenge);
+
+                // Live and on the right challenge, yet not eligible: only the death policy is left.
+                if (reason.empty())
+                    reason = delivery.Recipient + " is dead";
+            }
 
             return RefuseAll(delivery, reason, alreadyDelivered);
         }
