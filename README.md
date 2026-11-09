@@ -12,13 +12,15 @@ One cycle, every `HcVault.PollInterval` seconds:
 
 1. **Collect.** Every deliverable mail in the vault character's mailbox is emptied: items are parked
    in the vault and merged into the stacks already there, money is added to the character's purse,
-   anything written in the body is kept — along with a note of what came attached to it — and the
-   mail row is deleted. COD mail is left
-   alone — paying on the vault's behalf is not this module's decision.
+   a note of who sent what is kept — along with anything written in the body — and the mail row is
+   deleted. COD mail is left alone — paying on the vault's behalf is not this module's decision.
+   Returned mail — an order its recipient sent back, let expire, or died before opening — is taken
+   back into the vault but not reported as a donation: the goods were the vault's to begin with.
 2. **Push.** The complete stock and the character's purse go to the website. Always in full, never as
    a delta, so a push that is lost costs nothing but freshness.
-3. **Forward.** Letters that came in on donations are sent on, then deleted locally once the website
-   has them.
+3. **Forward.** Every donation — who sent it, what was in it, and any letter written on it — is sent
+   on, then deleted locally once the website has it. The website keeps the record of what arrived and
+   files the letters in its inbox.
 4. **Ask.** The website says which approved lines to mail and which recipients to describe.
 5. **Do.** Items are pulled out of the vault — splitting stacks where the order asks for part of one,
    and merging what comes out back into full stacks — and put in the mail, under the subject
@@ -83,8 +85,8 @@ All in the characters database; see `data/sql/db-characters/`.
 | --- | --- |
 | `mod_hcvault_stock` | One row per `item_instance` the vault is holding |
 | `mod_hcvault_delivery` | Order lines already mailed, under the order's reference, and whether the website has acknowledged each. This is what makes delivery exactly-once |
-| `mod_hcvault_letter` | Donation letters not yet accepted by the website |
-| `mod_hcvault_letter_item` | What came attached to those letters. Cascaded from the letter |
+| `mod_hcvault_letter` | Donations not yet accepted by the website: sender, money, and the letter if one was written |
+| `mod_hcvault_letter_item` | What came attached to those donations. Cascaded from the row above |
 | `mod_hcvault_reply` | Replies already mailed. Exactly-once, the same way deliveries are |
 
 ### Why the delivery table exists
@@ -118,9 +120,16 @@ slots is refused with a reason saying so instead.
 
 ### Why the letter table exists
 
-The mail a letter came in is deleted the moment it is collected, so the letter has to outlive it. It
-is buffered here and cleared only once the website has acknowledged it — otherwise a failed push
-would be the thing that lost somebody's message.
+The mail a donation came in is deleted the moment it is collected, so the record of it has to
+outlive the mail. It is buffered here and cleared only once the website has acknowledged it —
+otherwise a failed push would be the thing that lost somebody's message, or the record of what they
+gave.
+
+The table is named for what it first held. Every collected mail that brought in goods or money gets a
+row, written on or not (the `body` is then empty), and so does one carrying only a letter. The website
+keeps a record of each donation so it can say who sent what, and only a row with a body becomes a
+letter in its inbox. The tables keep their old names because they hold the only copy of anything not
+yet forwarded, and renaming them is not worth a step that could lose it.
 
 The attachment list beside it is a record, not a claim on anything: the items themselves went into the
 vault when the mail was collected. It is kept because a note is usually *about* the goods, and "the
@@ -235,7 +244,7 @@ box that piled up while the module was off drains over a few minutes instead of 
 
 Database reads happen on the world thread only. `CharacterDatabase.Query` spins looking for a free
 synchronous connection before it blocks on MySQL, which is no way to treat an io_context thread, so
-the donation letters are read where the stock snapshot is and handed over as a finished string.
+the buffered donations are read where the stock snapshot is and handed over as a finished string.
 Clearing them afterwards is a queued `Execute`, which costs the calling thread nothing.
 
 A cycle that somehow never reports is abandoned after a few times the HTTP timeout. `_busy` gates

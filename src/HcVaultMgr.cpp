@@ -265,11 +265,11 @@ namespace HcVault
         _vaultCopper = ReadVaultMoney(_config.VaultCharacterGuid);
 
         // Read before the scan writes anything, so this cycle forwards what earlier ones collected and
-        // nothing half-written. A letter collected below therefore goes out on the next cycle — which
+        // nothing half-written. A donation collected below therefore goes out on the next cycle — which
         // is what the buffer table is for, and a minute on somebody's thank-you note.
-        std::string letters;
-        std::string letterIds;
-        bool const haveLetters = BuildLetterPayload(letters, letterIds);
+        std::string donations;
+        std::string donationIds;
+        bool const haveDonations = BuildDonationPayload(donations, donationIds);
 
         ScanResult const scan = CollectDonations(_config, _config.VaultCharacterGuid, _stock);
         _vaultCopper += scan.CopperCollected;
@@ -278,8 +278,8 @@ namespace HcVault
         // replaced by a configuration reload — also on the world thread — and every hop after this one
         // runs on a network thread, where reading the member would be a race and finding it null a
         // crash.
-        PushStock(_http, haveLetters ? std::move(letters) : std::string(),
-                  haveLetters ? std::move(letterIds) : std::string());
+        PushStock(_http, haveDonations ? std::move(donations) : std::string(),
+                  haveDonations ? std::move(donationIds) : std::string());
     }
 
     uint32 Mgr::CycleWatchdogMs() const
@@ -329,12 +329,12 @@ namespace HcVault
         return payload.dump();
     }
 
-    void Mgr::PushStock(std::shared_ptr<Net::HttpClient> http, std::string letters, std::string letterIds)
+    void Mgr::PushStock(std::shared_ptr<Net::HttpClient> http, std::string donations, std::string donationIds)
     {
         LOG_DEBUG("module.hcvault", "[HCVault] Pushing {} stack(s).", _stock.StackCount());
 
         http->Post(kStockPath, BuildStockPayload(),
-            [this, http, letters = std::move(letters), letterIds = std::move(letterIds)]
+            [this, http, donations = std::move(donations), donationIds = std::move(donationIds)]
             (Net::Response response) mutable
         {
             if (!response.Ok)
@@ -345,11 +345,11 @@ namespace HcVault
                 LOG_WARN("module.hcvault", "[HCVault] Stock push failed: {}", response.Error);
             }
 
-            PushLetters(std::move(http), std::move(letters), std::move(letterIds));
+            PushDonations(std::move(http), std::move(donations), std::move(donationIds));
         });
     }
 
-    bool Mgr::BuildLetterPayload(std::string& payload, std::string& mailIds) const
+    bool Mgr::BuildDonationPayload(std::string& payload, std::string& mailIds) const
     {
         QueryResult result = CharacterDatabase.Query(
             "SELECT mail_id, sender, subject, body, money, sent_at, "
@@ -381,7 +381,7 @@ namespace HcVault
                 { "body", fields[3].Get<std::string>() },
                 { "copper", fields[4].Get<uint32>() },
                 { "sentAt", IsoTime(fields[5].Get<uint32>()) },
-                // Null rather than 0 for what is simply not known: a letter from something that is
+                // Null rather than 0 for what is simply not known: a mail from something that is
                 // not a player has no class, and 0 is a real class id in some other context.
                 { "senderClass", senderClass != 0 ? json(senderClass) : json(nullptr) },
                 { "senderLevel", senderLevel != 0 ? json(senderLevel) : json(nullptr) },
@@ -396,9 +396,8 @@ namespace HcVault
             ids += std::to_string(mailId);
         } while (result->NextRow());
 
-        // What came in the same mail, so the note can be read against what it is about. One query for
-        // the whole batch, restricted to the letters actually going out — the table can hold more than
-        // the hundred this cycle takes.
+        // What came in each mail. One query for the whole batch, restricted to the donations actually
+        // going out — the table can hold more than the hundred this cycle takes.
         if (QueryResult items = CharacterDatabase.Query(
                 "SELECT mail_id, item_entry, suffix_id, count FROM mod_hcvault_letter_item "
                 "WHERE mail_id IN ({})", ids))
@@ -424,13 +423,13 @@ namespace HcVault
 
         // Replaced rather than thrown on. A letter's text is whatever the sender's client put in the
         // packet, and a byte sequence MySQL stored but json will not encode would throw here on the
-        // world thread, every cycle, for as long as the letter waited to be pushed.
+        // world thread, every cycle, for as long as the donation waited to be pushed.
         payload = document.dump(-1, ' ', false, json::error_handler_t::replace);
         mailIds = std::move(ids);
         return true;
     }
 
-    void Mgr::PushLetters(std::shared_ptr<Net::HttpClient> http, std::string payload, std::string mailIds)
+    void Mgr::PushDonations(std::shared_ptr<Net::HttpClient> http, std::string payload, std::string mailIds)
     {
         // Nothing buffered when the cycle started. Read there rather than here because this runs on a
         // network thread, and CharacterDatabase.Query spins looking for a free synchronous connection
@@ -458,7 +457,7 @@ namespace HcVault
             }
             else
             {
-                LOG_WARN("module.hcvault", "[HCVault] Letter push failed, keeping them for the next cycle: {}",
+                LOG_WARN("module.hcvault", "[HCVault] Donation push failed, keeping them for the next cycle: {}",
                     response.Error);
             }
 

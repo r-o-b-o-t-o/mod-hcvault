@@ -36,7 +36,25 @@ namespace HcVault
             uint32 Money = 0;
             uint32 Cod = 0;
             uint32 DeliverTime = 0;
+            uint8 Checked = 0;
+
+            /// A mail that bounced back to the vault — returned by its recipient, expired unread, or
+            /// sent back by the core when the recipient's character was deleted, which on a hardcore
+            /// realm is what dying does. The core swaps sender and receiver, so `Sender` is now the
+            /// person the vault mailed, and reporting this as a gift from them would be false.
+            bool IsReturned() const { return (Checked & MAIL_CHECK_MASK_RETURNED) != 0; }
         };
+
+        /// Whether a collected mail is reported to the website.
+        ///
+        /// Every donation is, letter or not: the website keeps a record of who gave what, and files
+        /// the body as a letter when there is one. A mail with nothing in it — a subject and no more —
+        /// gave the vault nothing to record. A returned mail is never reported: its goods still go
+        /// back into the vault, but they were the vault's to begin with.
+        bool IsForwarded(MailRow const& mail, bool hasItems)
+        {
+            return !mail.IsReturned() && (!mail.Body.empty() || mail.Money > 0 || hasItems);
+        }
 
         /// Items asked for in one statement. High enough that a full mailbox is one round trip, low
         /// enough that the statement cannot grow towards what the server will accept.
@@ -196,7 +214,7 @@ namespace HcVault
         // otherwise be collected in a single stall. What is left waits for the next cycle a minute
         // later, and the stock push is a full picture every time, so nothing is lost by waiting.
         QueryResult mails = CharacterDatabase.Query(
-            "SELECT id, messageType, sender, subject, body, money, cod, deliver_time "
+            "SELECT id, messageType, sender, subject, body, money, cod, deliver_time, checked "
             "FROM mail WHERE receiver = {} AND deliver_time <= {} ORDER BY id LIMIT {}",
             vaultCharacterGuid, now, kMailsPerCycle);
 
@@ -217,6 +235,7 @@ namespace HcVault
             row.Money = fields[5].Get<uint32>();
             row.Cod = fields[6].Get<uint32>();
             row.DeliverTime = fields[7].Get<uint32>();
+            row.Checked = fields[8].Get<uint8>();
 
             rows.push_back(std::move(row));
         } while (mails->NextRow());
@@ -247,14 +266,14 @@ namespace HcVault
 
         std::unordered_map<uint32, std::unique_ptr<Item>> loadedItems = LoadMailedItems(wanted);
 
-        // Every letter's sender in one go, for the same reason the attachments above are read that
-        // way. One lookup per letter was a synchronous round trip per letter on the world thread —
-        // some fourteen milliseconds for a full box of a hundred, spent inside the transaction that
-        // empties it.
+        // The sender of every mail that will be forwarded, in one go, for the same reason the
+        // attachments above are read that way. One lookup per mail was a synchronous round trip per
+        // mail on the world thread — some fourteen milliseconds for a full box of a hundred, spent
+        // inside the transaction that empties it.
         std::vector<uint32> senderGuids;
         for (MailRow const& mail : rows)
         {
-            if (mail.Cod == 0 && mail.MessageType == MAIL_NORMAL && !mail.Body.empty())
+            if (mail.Cod == 0 && mail.MessageType == MAIL_NORMAL && IsForwarded(mail, attachments.contains(mail.Id)))
                 senderGuids.push_back(mail.Sender);
         }
 
@@ -318,10 +337,9 @@ namespace HcVault
             // transaction — is not a state worth creating.
             trans->Append("DELETE FROM mail_items WHERE mail_id = {}", mail.Id);
 
-            // Noted before the items are destroyed, and kept whether or not there turns out to be a
-            // letter to attach it to — the cost is a few structs, and reaching back for it afterwards
-            // would mean reading rows that have just been rewritten.
-            std::vector<LetterAttachment> attached;
+            // Noted before the items are destroyed: reaching back for it afterwards would mean reading
+            // rows that have just been rewritten.
+            std::vector<DonatedStack> attached;
             attached.reserve(collected.size());
 
             for (std::unique_ptr<Item> const& item : collected)
@@ -339,57 +357,64 @@ namespace HcVault
                 result.CopperCollected += mail.Money;
             }
 
-            if (!mail.Body.empty())
+            if (mail.IsReturned())
+            {
+                ++result.MailsReturned;
+                LOG_DEBUG("module.hcvault", "[HCVault] Mail {} was returned to the vault; taken back, not reported.",
+                    mail.Id);
+            }
+
+            if (IsForwarded(mail, !attached.empty()))
             {
                 ResolvedCharacter const sender = SenderOf(senders, mail);
 
-                CollectedLetter letter;
-                letter.MailId = mail.Id;
-                letter.Sender = sender.Name;
-                letter.SenderClass = sender.Class;
-                letter.SenderLevel = sender.Level;
-                letter.SenderHasChallenge = sender.HasChallenge;
-                letter.SenderChallenge = sender.Challenge;
-                letter.SenderDead = sender.Dead;
-                letter.Subject = TruncateUtf8(mail.Subject, kMaxSubjectBytes);
-                letter.Body = TruncateUtf8(mail.Body, kMaxBodyBytes);
+                CollectedDonation donation;
+                donation.MailId = mail.Id;
+                donation.Sender = sender.Name;
+                donation.SenderClass = sender.Class;
+                donation.SenderLevel = sender.Level;
+                donation.SenderHasChallenge = sender.HasChallenge;
+                donation.SenderChallenge = sender.Challenge;
+                donation.SenderDead = sender.Dead;
+                donation.Subject = TruncateUtf8(mail.Subject, kMaxSubjectBytes);
+                donation.Body = TruncateUtf8(mail.Body, kMaxBodyBytes);
 
-                if (letter.Subject.size() < mail.Subject.size() || letter.Body.size() < mail.Body.size())
+                if (donation.Subject.size() < mail.Subject.size() || donation.Body.size() < mail.Body.size())
                 {
                     // Rare enough to be worth a line, and it used to be the thing that wedged the
                     // whole letter queue without saying anything at all.
                     LOG_INFO("module.hcvault",
                         "[HCVault] Mail {} has an over-long subject or body; forwarding it cut to {} and {} bytes.",
-                        mail.Id, letter.Subject.size(), letter.Body.size());
+                        mail.Id, donation.Subject.size(), donation.Body.size());
                 }
 
-                letter.SentAt = mail.DeliverTime;
-                letter.Copper = mail.Money;
-                letter.Attachments = std::move(attached);
+                donation.SentAt = mail.DeliverTime;
+                donation.Copper = mail.Money;
+                donation.Attachments = std::move(attached);
 
-                // Buffered in the same transaction that deletes the mail. The letter has to outlive
+                // Buffered in the same transaction that deletes the mail. The record has to outlive
                 // the mail it came in, and a push that fails must not be the thing that loses it.
                 trans->Append(
                     "REPLACE INTO mod_hcvault_letter "
                     "(mail_id, sender, sender_class, sender_level, sender_challenge, sender_dead, "
                     " subject, body, money, sent_at) "
                     "VALUES ({}, '{}', {}, {}, {}, {}, '{}', '{}', {}, {})",
-                    letter.MailId,
-                    EscapeForSql(letter.Sender),
-                    letter.SenderClass,
-                    letter.SenderLevel,
-                    letter.SenderHasChallenge ? std::to_string(letter.SenderChallenge) : "NULL",
-                    letter.SenderDead ? 1 : 0,
-                    EscapeForSql(letter.Subject),
-                    EscapeForSql(letter.Body),
-                    letter.Copper,
-                    letter.SentAt);
+                    donation.MailId,
+                    EscapeForSql(donation.Sender),
+                    donation.SenderClass,
+                    donation.SenderLevel,
+                    donation.SenderHasChallenge ? std::to_string(donation.SenderChallenge) : "NULL",
+                    donation.SenderDead ? 1 : 0,
+                    EscapeForSql(donation.Subject),
+                    EscapeForSql(donation.Body),
+                    donation.Copper,
+                    donation.SentAt);
 
                 // Summed by stack rather than one row per attachment: a mail can carry the same thing
                 // twice, and the primary key would reject the second. "10 Linen Cloth" is what the
                 // reader wants anyway.
                 std::map<std::pair<uint32, int32>, uint32> byStack;
-                for (LetterAttachment const& attachment : letter.Attachments)
+                for (DonatedStack const& attachment : donation.Attachments)
                     byStack[{ attachment.Entry, attachment.SuffixId }] += attachment.Count;
 
                 for (auto const& [stack, count] : byStack)
@@ -397,10 +422,10 @@ namespace HcVault
                     trans->Append(
                         "REPLACE INTO mod_hcvault_letter_item (mail_id, item_entry, suffix_id, count) "
                         "VALUES ({}, {}, {}, {})",
-                        letter.MailId, stack.first, stack.second, count);
+                        donation.MailId, stack.first, stack.second, count);
                 }
 
-                result.Letters.push_back(std::move(letter));
+                result.Donations.push_back(std::move(donation));
             }
 
             trans->Append("DELETE FROM mail WHERE id = {}", mail.Id);
@@ -433,9 +458,9 @@ namespace HcVault
         if (result.MailsCollected > 0 || result.MailsSkipped > 0)
         {
             LOG_INFO("module.hcvault",
-                "[HCVault] Collected {} mail(s): {} item(s) and {} copper, {} letter(s) forwarded, {} left behind.",
+                "[HCVault] Collected {} mail(s): {} item(s) and {} copper, {} to forward, {} returned, {} left behind.",
                 result.MailsCollected, result.ItemsCollected, result.CopperCollected,
-                result.Letters.size(), result.MailsSkipped);
+                result.Donations.size(), result.MailsReturned, result.MailsSkipped);
         }
 
         return result;

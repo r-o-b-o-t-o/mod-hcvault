@@ -28,7 +28,7 @@ namespace HcVault
     /// One cycle, on a timer:
     ///   1. empty the vault character's mailbox into the vault  (world thread)
     ///   2. push the whole stock and the money to the website    (network thread)
-    ///   3. forward any letters that came with donations         (network thread)
+    ///   3. forward the donations collected, and their letters   (network thread)
     ///   4. ask what to deliver and who to describe              (network thread)
     ///   5. do it                                                (world thread)
     ///   6. report what came of it, and any delivery the website
@@ -95,19 +95,20 @@ namespace HcVault
         /// called on the world thread; the result is a finished string safe to post from anywhere.
         [[nodiscard]] std::string BuildStockPayload() const;
 
-        /// Reads the buffered donation letters and builds the push for them.
+        /// Reads the buffered donations — with their letters, where they had one — and builds the
+        /// push for them.
         ///
         /// Must be called on the world thread: it reads the database, and a synchronous read from a
         /// network thread spins on GetFreeConnection before blocking on MySQL. Returns false when
         /// there is nothing to send, leaving both outputs untouched.
-        [[nodiscard]] bool BuildLetterPayload(std::string& payload, std::string& mailIds) const;
+        [[nodiscard]] bool BuildDonationPayload(std::string& payload, std::string& mailIds) const;
 
         // The client is passed down the chain rather than read from `_http` at each hop. Every one of
         // these after the first runs on a network thread, while `_http` is replaced on the world
         // thread by a configuration reload — so a cycle finishes on the client it started with, and
         // no network thread ever touches the member.
-        void PushStock(std::shared_ptr<Net::HttpClient> http, std::string letters, std::string letterIds);
-        void PushLetters(std::shared_ptr<Net::HttpClient> http, std::string payload, std::string mailIds);
+        void PushStock(std::shared_ptr<Net::HttpClient> http, std::string donations, std::string donationIds);
+        void PushDonations(std::shared_ptr<Net::HttpClient> http, std::string payload, std::string mailIds);
         void FetchWork(std::shared_ptr<Net::HttpClient> http);
         void HandleWork(std::string const& body);
 
