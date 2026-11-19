@@ -91,6 +91,13 @@ All in the characters database; see `data/sql/db-characters/`.
 | `mod_hcvault_reply` | Replies already mailed, under the website's id and token for each. Exactly-once: a reply whose report was lost is offered again, and recognised here instead of posted twice |
 | `mod_hcvault_outgoing` | Plain mails already sent, under the website's token for each. Exactly-once, the same way replies are |
 
+At startup, and on every `.reload config`, the module checks that every table and column it queries
+exists before it reads any of them: these, and the challenge-modes table the configuration names. If
+one is missing — a SQL file the database updater did not apply, or a misnamed challenge table — it
+logs which, and what puts it right, and stays idle until a restart or a reload finds everything in
+place. Without the check, the first query to name it would abort the whole worldserver: the core
+treats a missing table or column as fatal. The website keeps the work queued meanwhile.
+
 ### Why the delivery table exists
 
 The row is written **in the same transaction as the mail** — and so is the claim that took the goods
@@ -142,6 +149,10 @@ axe is for whoever needs it, the rest is spares" is unreadable on its own.
 1. Clone into `modules/`, then re-run CMake and rebuild the worldserver.
 2. Copy `conf/mod_hcvault.conf.dist` to your configuration directory as `mod_hcvault.conf` and fill
    it in.
+3. Make sure `data/sql/db-characters/` reaches the characters database. The core's updater applies it
+   at startup only when the characters database is in `Updates.EnableDatabases` and the worldserver
+   finds the source tree, at its build path or `SourceDirectory`; otherwise run each file by hand,
+   in order. The module refuses to start its cycles until all of it is there.
 
 The two settings with no sensible default are `HcVault.VaultCharacterGuid` and
 `HcVault.Website.Passkey`. The module refuses to run without either, and says which one is missing.

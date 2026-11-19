@@ -22,7 +22,8 @@ namespace HcVault
         /// The columns every challenge-modes read selects, in the order ApplyChallengeFields expects.
         ///
         /// In one place because that function reads them by index. A batched read appends `guid`
-        /// after them, which disturbs nothing.
+        /// after them, which disturbs nothing. A column added here is added to kChallengeTableColumns
+        /// too, or the startup check will not know to look for it.
         constexpr char const* kChallengeColumns = "name, class, level, challenge, dead";
 
         /// Merges one challenge-modes row into a character, filling only what is not already known.

@@ -72,8 +72,13 @@ namespace HcVault
     private:
         Mgr() = default;
 
-        /// True when the module is configured, enabled and has a client.
+        /// True when the module is configured, enabled, has every table it queries, and has a client.
         [[nodiscard]] bool IsRunnable() const;
+
+        /// Checks the tables the module queries and, the first time they are all there, reads the
+        /// vault into memory. From OnStartup, and again on every reload. World thread only: it reads
+        /// the database synchronously.
+        void Start();
 
         /// Builds the website client if the configuration is usable and there is an io_context to
         /// build it on. Safe to call twice; does nothing when a client already exists.
@@ -159,6 +164,10 @@ namespace HcVault
 
         /// Set by the world tick when the vault is loaded; nothing runs before it.
         bool _ready = false;
+
+        /// What the database is missing of the tables and columns the module queries, found at startup
+        /// or on a reload, or empty when it has everything. While set the module stays idle: see Start.
+        std::string _schemaProblem;
 
         /// The answer to step 4, handed from the network thread to the world thread.
         std::mutex _workMutex;

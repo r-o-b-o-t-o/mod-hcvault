@@ -3,6 +3,7 @@
 #include "DatabaseEnv.h"
 #include "Field.h"
 #include "GameTime.h"
+#include "HcVaultCharacters.h"
 #include "HcVaultDelivery.h"
 #include "HcVaultMailbox.h"
 #include "IoContext.h"
@@ -15,6 +16,7 @@
 #include <boost/asio/strand.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <ctime>
 #include <unordered_map>
@@ -71,6 +73,113 @@ namespace HcVault
 
             return body.substr(0, limit) + "...";
         }
+
+        /// One table, or one column of it, that a query of this module names.
+        struct SchemaRequirement
+        {
+            /// Empty for the characters database itself.
+            std::string Database;
+
+            std::string Table;
+
+            /// Empty when the table existing is the whole requirement.
+            std::string Column;
+
+            /// What puts it right, named in the error so the fix is obvious.
+            std::string Remedy;
+        };
+
+        /// What the module's queries need: one entry per thing each of its SQL files adds that the code
+        /// reads — a new file in data/sql/db-characters adds its own entries here — and the
+        /// challenge-modes table, which another module owns and the configuration names.
+        std::vector<SchemaRequirement> RequiredSchema(Config const& config)
+        {
+            std::vector<SchemaRequirement> schema = {
+                { "", "mod_hcvault_stock", "", "apply mod_hcvault_000_base.sql" },
+                { "", "mod_hcvault_delivery", "", "apply mod_hcvault_000_base.sql" },
+                { "", "mod_hcvault_letter", "", "apply mod_hcvault_000_base.sql" },
+                { "", "mod_hcvault_letter", "money", "apply mod_hcvault_001_letter_attachments.sql" },
+                { "", "mod_hcvault_letter_item", "", "apply mod_hcvault_001_letter_attachments.sql" },
+                // 002 adds the four sender columns in one statement, so the last stands for all of them.
+                { "", "mod_hcvault_letter", "sender_dead", "apply mod_hcvault_002_sender_and_replies.sql" },
+                { "", "mod_hcvault_reply", "", "apply mod_hcvault_002_sender_and_replies.sql" },
+                { "", "mod_hcvault_delivery", "reference", "apply mod_hcvault_003_delivery_reported.sql" },
+                { "", "mod_hcvault_delivery", "reported", "apply mod_hcvault_003_delivery_reported.sql" },
+                { "", "mod_hcvault_outgoing", "", "apply mod_hcvault_005_outgoing.sql" },
+                { "", "mod_hcvault_reply", "token", "apply mod_hcvault_006_reply_token.sql" },
+            };
+
+            std::string const challengeRemedy = "check HcVault.ChallengeDatabase and HcVault.ChallengeTable";
+            schema.push_back({ config.ChallengeDatabase, config.ChallengeTable, "", challengeRemedy });
+            for (char const* column : kChallengeTableColumns)
+                schema.push_back({ config.ChallengeDatabase, config.ChallengeTable, column, challengeRemedy });
+
+            return schema;
+        }
+
+        /// What the database lacks of RequiredSchema, as a sentence, or empty when nothing.
+        ///
+        /// Asked of information_schema, because asking the tables themselves is exactly what must not
+        /// happen: the core aborts the whole worldserver on a query naming a table or column that does
+        /// not exist (ER_NO_SUCH_TABLE, ER_BAD_FIELD_ERROR in MySQLConnection::_HandleMySQLErrno). One
+        /// missing SQL file took the realm down on the first cycle that needed it, and on every restart
+        /// after, since the work that needed it was still waiting.
+        ///
+        /// The challenge identifiers are safe to write into the query: Config::Problem refuses anything
+        /// but letters, digits and underscores, and this only runs once it has passed.
+        std::string MissingSchema(Config const& config)
+        {
+            std::string missing;
+            std::vector<std::string> remedies;
+
+            // A table found missing is not reported again for each of its columns. RequiredSchema lists
+            // every table ahead of its columns.
+            std::vector<std::string> missingTables;
+
+            for (SchemaRequirement const& need : RequiredSchema(config))
+            {
+                std::string const key = need.Database + "." + need.Table;
+                if (!need.Column.empty()
+                    && std::find(missingTables.begin(), missingTables.end(), key) != missingTables.end())
+                    continue;
+
+                std::string const schema = need.Database.empty() ? "DATABASE()" : "'" + need.Database + "'";
+
+                QueryResult const result = need.Column.empty()
+                    ? CharacterDatabase.Query(
+                        "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = {} AND TABLE_NAME = '{}'",
+                        schema, need.Table)
+                    : CharacterDatabase.Query(
+                        "SELECT 1 FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA = {} AND TABLE_NAME = '{}' AND COLUMN_NAME = '{}'",
+                        schema, need.Table, need.Column);
+
+                if (result)
+                    continue;
+
+                if (need.Column.empty())
+                    missingTables.push_back(key);
+
+                std::string const table = need.Database.empty() ? need.Table : need.Database + "." + need.Table;
+
+                missing += missing.empty() ? "" : ", ";
+                missing += need.Column.empty() ? "table " + table : "column " + table + "." + need.Column;
+
+                // In the order the requirements are listed, which for the SQL files is the order they
+                // apply in.
+                if (std::find(remedies.begin(), remedies.end(), need.Remedy) == remedies.end())
+                    remedies.push_back(need.Remedy);
+            }
+
+            if (missing.empty())
+                return {};
+
+            std::string fix;
+            for (std::string const& remedy : remedies)
+                fix += (fix.empty() ? "" : "; ") + remedy;
+
+            return missing + " (" + fix + ")";
+        }
     }
 
     Mgr* Mgr::instance()
@@ -118,6 +227,12 @@ namespace HcVault
         // Null at startup, because the configuration is read before networking starts; OnNetworkStart
         // builds the first client. On a reload it is set, and this is what puts the client back.
         EnsureClient();
+
+        // At startup the database is not open yet, and OnStartup does this once the world is up. On a
+        // reload it is, and checking again matters: the reload may have renamed the challenge table, and
+        // it is also how a module left idle by a missing table starts once the SQL has been applied.
+        if (reload)
+            Start();
     }
 
     void Mgr::EnsureClient()
@@ -140,7 +255,37 @@ namespace HcVault
 
     void Mgr::OnStartup()
     {
+        Start();
+    }
+
+    void Mgr::Start()
+    {
         if (!_usable)
+            return;
+
+        // Before anything reads the tables, the stock load included. A table or column the code needs
+        // and the database lacks would otherwise abort the worldserver from inside the core's query
+        // handling. Idle with a loud error instead: the realm stays up, and the vault waits, its work
+        // queued on the website, until the database is put right and the module restarted or the
+        // configuration reloaded.
+        _schemaProblem = MissingSchema(_config);
+        if (!_schemaProblem.empty())
+        {
+            LOG_ERROR("module.hcvault",
+                "[HCVault] The database is missing {}. The module will do nothing until that is put right "
+                "and the server restarted or `.reload config` run.",
+                _schemaProblem);
+
+            // A cycle in flight would otherwise keep `_busy` set for good: OnUpdate returns before the
+            // watchdog while the module is not runnable.
+            DiscardCycle();
+            return;
+        }
+
+        // Already running, after a reload that found nothing wrong. Loading the vault again would read
+        // the table back while the cycle's own writes may still be queued, and replace a correct picture
+        // with an older one.
+        if (_ready)
             return;
 
         _stock.Load();
@@ -163,7 +308,7 @@ namespace HcVault
 
     bool Mgr::IsRunnable() const
     {
-        return _usable && _ready && _http != nullptr;
+        return _usable && _ready && _schemaProblem.empty() && _http != nullptr;
     }
 
     bool Mgr::VaultCharacterIsOnline() const
@@ -176,6 +321,8 @@ namespace HcVault
         if (!IsRunnable())
         {
             reason = _config.Enabled ? _config.Problem() : "the module is disabled";
+            if (reason.empty() && !_schemaProblem.empty())
+                reason = "the database is missing " + _schemaProblem;
             if (reason.empty())
                 reason = "the module is not ready yet";
 

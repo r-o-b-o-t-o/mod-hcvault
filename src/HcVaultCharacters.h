@@ -11,6 +11,11 @@ namespace HcVault
 {
     struct Config;
 
+    /// Every column of the challenge-modes table this file reads, for the startup check in Mgr: the
+    /// core aborts the worldserver on a query naming one that does not exist. Kept in step with the
+    /// queries in HcVaultCharacters.cpp, which select kChallengeColumns and filter on `guid`.
+    inline constexpr char const* kChallengeTableColumns[] = { "guid", "name", "class", "level", "challenge", "dead" };
+
     /// What the realm knows about a character, whether or not it still has one.
     ///
     /// A hardcore death deletes the character, so the realm forgets it and the character cache
